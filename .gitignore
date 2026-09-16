@@ -1,0 +1,23 @@
+# macOS metadata
+.DS_Store
+
+# CMake and generated build output
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Compiled audio plug-ins and applications
+*.a
+*.dylib
+*.so
+*.vst3
+*.component
+*.app
+
+# Editor files
+.vscode/
+.idea/
+*.swp
