@@ -2,7 +2,7 @@
 
 Early JUCE implementation of a multiband modulation plug-in. The current milestone provides:
 
-- VST3, Audio Unit, and Standalone build targets on macOS
+- AU, VST3, and Standalone builds on macOS (universal arm64 + x86_64); VST3 and Standalone on Windows and Linux
 - An audio-driven FFT spectrum analyzer
 - Click-to-create frequency bands
 - Draggable crossover dividers
@@ -57,6 +57,51 @@ cmake --build build --target StagMotionBands_VST3 StagMotionBands_AU -j 4
 ```
 
 The project intentionally does not copy plug-ins into system folders after building.
+
+## Platforms and CI
+
+| Platform | Architectures | Formats | Minimum OS |
+| --- | --- | --- | --- |
+| macOS | Universal (arm64 + x86_64) | AU, VST3, Standalone | macOS 11 |
+| Windows | x64 | VST3, Standalone | |
+| Linux | x64 | VST3, Standalone | |
+
+macOS universal build (Apple silicon and Intel in one binary):
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+cmake --build build --config Release --parallel --target StagMotionBands_VST3 StagMotionBands_AU StagMotionBands_Standalone
+```
+
+Windows x64 (Visual Studio generator, which is multi-config, so pass `--config Release`;
+plug-ins link the static MSVC runtime, so no VC++ redistributable is needed):
+
+```sh
+cmake -S . -B build -A x64
+cmake --build build --config Release --parallel --target StagMotionBands_VST3 StagMotionBands_Standalone
+```
+
+Linux x64 (Debian/Ubuntu packages; curl, WebKit and GTK are not needed because the web
+browser and curl support are disabled):
+
+```sh
+sudo apt-get install build-essential pkg-config libasound2-dev libfreetype-dev \
+  libfontconfig1-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
+  libxinerama-dev libxrandr-dev libxrender-dev libgl1-mesa-dev
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel --target StagMotionBands_VST3 StagMotionBands_Standalone
+```
+
+Every platform writes its plug-ins to `build/StagMotionBands_artefacts/Release/`.
+
+GitHub Actions (`.github/workflows/build.yml`) builds and runs the smoke tests on every
+push and pull request for macOS universal, macOS Intel (native x86_64 test run), Windows
+x64 and Linux x64 (tests under `xvfb-run`). The macOS job also checks with `lipo` that
+every binary contains both architectures. The plug-ins are uploaded as the workflow
+artifacts `StagMotionBands-macOS-universal`, `StagMotionBands-Windows-x64` and
+`StagMotionBands-Linux-x64`. These builds are unsigned and not notarised, so expect
+Gatekeeper warnings on macOS (remove the quarantine attribute or allow the plug-in in
+System Settings) and SmartScreen warnings on Windows.
 
 ## Test
 

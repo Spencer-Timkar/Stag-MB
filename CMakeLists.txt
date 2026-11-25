@@ -1,10 +1,17 @@
 cmake_minimum_required(VERSION 3.22)
 
+# Must be cached before project(): enabling the languages on macOS creates an empty
+# cache entry, which a later set(... CACHE ...) would not override.
+set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum supported macOS version")
+
+# Link the MSVC runtime statically so the Windows plug-ins need no VC++ redistributable.
+# Applies to every target created below (policy CMP0091 is NEW from CMake 3.15).
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 project(StagMotionBands VERSION 0.7.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum supported macOS version")
 
 include(FetchContent)
 
