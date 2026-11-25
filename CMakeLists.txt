@@ -41,6 +41,13 @@ juce_add_plugin(StagMotionBands
 
 juce_generate_juce_header(StagMotionBands)
 
+juce_add_binary_data(StagMotionBandsBrand
+    SOURCES
+        Assets/Inter400.ttf
+        Assets/Inter600.ttf
+        Assets/stag-mark.svg
+)
+
 target_sources(StagMotionBands
     PRIVATE
         Source/PluginEditor.cpp
@@ -48,6 +55,8 @@ target_sources(StagMotionBands
         Source/ModulationDSP.h
         Source/PluginProcessor.cpp
         Source/PluginProcessor.h
+        Source/StagLookAndFeel.cpp
+        Source/StagLookAndFeel.h
 )
 
 target_compile_definitions(StagMotionBands
@@ -60,6 +69,7 @@ target_compile_definitions(StagMotionBands
 
 target_link_libraries(StagMotionBands
     PRIVATE
+        StagMotionBandsBrand
         juce::juce_audio_utils
         juce::juce_dsp
     PUBLIC
@@ -93,6 +103,7 @@ target_compile_definitions(StagMotionBandsTests
 target_link_libraries(StagMotionBandsTests
     PRIVATE
         StagMotionBands
+        StagMotionBandsBrand
         juce::juce_audio_utils
         juce::juce_dsp
         juce::juce_recommended_config_flags

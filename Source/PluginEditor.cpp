@@ -1,30 +1,56 @@
 #include "PluginEditor.h"
 
+using namespace StagColours;
+
 namespace
 {
-const juce::Colour background { 0xff060807 };     // Stag Black
-const juce::Colour deepPlum { 0xff0d0612 };
-const juce::Colour panel { 0xff0d0612 };
-const juce::Colour panelRaised { 0xff171419 };    // Carbon
-const juce::Colour text { 0xffebe8d9 };           // Stag Ivory
-const juce::Colour disabledText { 0xff66645f };   // Ash
-const juce::Colour mutedText = text.withAlpha (0.65f);
-const juce::Colour grid = text.withAlpha (0.14f);
-const juce::Colour accent { 0xffad59f5 };         // Stag Violet
-const juce::Colour accentHover { 0xffd2a4fa };    // Pale Violet
-const juce::Colour accentPressed { 0xff7130b5 };  // Dark Violet
-const juce::Colour accentSoft = accent.withAlpha (0.30f);
-const juce::Colour destructive { 0xffd65c68 };    // Reserved for mute/error state
-
 constexpr float minimumFrequency = 20.0f;
 constexpr float maximumFrequency = 20000.0f;
+constexpr float floorDb = -100.0f;
+constexpr std::array<float, 10> frequencyLines {
+    20.0f, 50.0f, 100.0f, 200.0f, 500.0f,
+    1000.0f, 2000.0f, 5000.0f, 10000.0f, 20000.0f
+};
+
+StagLookAndFeel& themeOf (juce::Component& component)
+{
+    if (auto* theme = dynamic_cast<StagLookAndFeel*> (&component.getLookAndFeel()))
+        return *theme;
+
+    static StagLookAndFeel fallback;
+    return fallback;
 }
 
+int currentEffect (StagMotionBandsAudioProcessor& processor, int band)
+{
+    return static_cast<int> (std::lround (
+        processor.getParameters().getRawParameterValue (
+            StagMotionBandsAudioProcessor::effectTypeParameterId (band))->load()));
+}
+
+bool parameterIsOn (StagMotionBandsAudioProcessor& processor, const juce::String& parameterId)
+{
+    return processor.getParameters().getRawParameterValue (parameterId)->load() >= 0.5f;
+}
+
+juce::String formatHz (float frequency)
+{
+    if (frequency >= 1000.0f)
+        return juce::String (frequency / 1000.0f, frequency >= 10000.0f ? 1 : 2)
+                   .trimCharactersAtEnd ("0").trimCharactersAtEnd (".") + " kHz";
+
+    return juce::String (juce::roundToInt (frequency)) + " Hz";
+}
+}
+
+//==============================================================================
 SpectrumBandEditor::SpectrumBandEditor (StagMotionBandsAudioProcessor& owner)
     : processor (owner)
 {
     setMouseCursor (juce::MouseCursor::CrosshairCursor);
     setWantsKeyboardFocus (true);
+    setTitle ("Band spectrum");
+    setDescription ("Double-click to add a band. Drag a divider to move it. Double-click a divider to remove it.");
 
     auto& state = processor.getParameters();
 
@@ -39,22 +65,22 @@ SpectrumBandEditor::SpectrumBandEditor (StagMotionBandsAudioProcessor& owner)
         remove.setButtonText (juce::String::fromUTF8 ("\xc3\x97"));
         solo.setClickingTogglesState (true);
         mute.setClickingTogglesState (true);
-        solo.setColour (juce::TextButton::buttonColourId, panelRaised);
-        solo.setColour (juce::TextButton::buttonOnColourId, accentPressed);
-        solo.setColour (juce::TextButton::textColourOffId, mutedText);
-        solo.setColour (juce::TextButton::textColourOnId, background);
-        mute.setColour (juce::TextButton::buttonColourId, panelRaised);
-        mute.setColour (juce::TextButton::buttonOnColourId, destructive);
-        mute.setColour (juce::TextButton::textColourOffId, mutedText);
-        mute.setColour (juce::TextButton::textColourOnId, text);
-        remove.setColour (juce::TextButton::buttonColourId, panelRaised);
-        remove.setColour (juce::TextButton::buttonOnColourId, destructive);
-        remove.setColour (juce::TextButton::textColourOffId, destructive);
-        remove.setColour (juce::TextButton::textColourOnId, text);
+
+        for (auto* button : { &solo, &mute, &remove })
+        {
+            button->getProperties().set (StagProperties::onViolet, true);
+            button->getProperties().set (StagProperties::chip, true);
+            button->setColour (juce::TextButton::textColourOffId, cream);
+        }
+
+        solo.setColour (juce::TextButton::buttonOnColourId, apricot);
+        solo.setColour (juce::TextButton::textColourOnId, ink);
+        mute.setColour (juce::TextButton::buttonOnColourId, ink);
+        mute.setColour (juce::TextButton::textColourOnId, cream);
 
         solo.setTooltip ("Solo band " + juce::String (band + 1));
         mute.setTooltip ("Mute band " + juce::String (band + 1));
-        remove.setTooltip ("Remove band " + juce::String (band + 1));
+        remove.setTooltip ("Remove band " + juce::String (band + 1) + " and merge it with its neighbour");
         solo.onClick = [this, band] { selectBand (band); };
         mute.onClick = [this, band] { selectBand (band); };
         remove.onClick = [this, band] {
@@ -77,7 +103,7 @@ SpectrumBandEditor::SpectrumBandEditor (StagMotionBandsAudioProcessor& owner)
                 state, StagMotionBandsAudioProcessor::muteParameterId (band), mute);
     }
 
-    spectrumDb.fill (-100.0f);
+    displayDb.fill (floorDb);
     startTimerHz (30);
 }
 
@@ -112,16 +138,12 @@ void SpectrumBandEditor::selectNextBand()
 
 juce::Rectangle<float> SpectrumBandEditor::plotBounds() const
 {
-    return getLocalBounds().toFloat().reduced (18.0f).withTrimmedBottom (20.0f);
+    return getLocalBounds().toFloat().reduced (1.0f).withTrimmedBottom (24.0f);
 }
 
-void SpectrumBandEditor::paint (juce::Graphics& g)
+std::array<float, StagMotionBandsAudioProcessor::maxBands + 1> SpectrumBandEditor::bandEdges() const
 {
-    auto plot = plotBounds();
-
-    g.setColour (panel);
-    g.fillRoundedRectangle (getLocalBounds().toFloat(), 16.0f);
-
+    const auto plot = plotBounds();
     const auto bandCount = processor.getBandCount();
     const auto crossovers = processor.getSortedCrossovers();
 
@@ -130,136 +152,184 @@ void SpectrumBandEditor::paint (juce::Graphics& g)
     for (int index = 0; index < bandCount - 1; ++index)
         edges[static_cast<size_t> (index + 1)] = frequencyToX (crossovers[static_cast<size_t> (index)]);
     edges[static_cast<size_t> (bandCount)] = plot.getRight();
+    return edges;
+}
 
-    for (int band = 0; band < bandCount; ++band)
+void SpectrumBandEditor::paint (juce::Graphics& g)
+{
+    auto& theme = themeOf (*this);
+    const auto plot = plotBounds();
+    const auto bandCount = processor.getBandCount();
+    const auto crossovers = processor.getSortedCrossovers();
+    const auto edges = bandEdges();
+    const auto& names = EffectMenuPanel::effectNames();
+
+    g.setColour (deepViolet);
+    g.fillRoundedRectangle (plot, 12.0f);
+
     {
-        const auto bandArea = juce::Rectangle<float>::leftTopRightBottom (
-            edges[static_cast<size_t> (band)], plot.getY(),
-            edges[static_cast<size_t> (band + 1)], plot.getBottom());
-
-        if ((band % 2) == 1)
+        juce::Graphics::ScopedSaveState clipped (g);
         {
-            g.setColour (text.withAlpha (0.025f));
-            g.fillRect (bandArea);
+            juce::Path clip;
+            clip.addRoundedRectangle (plot, 12.0f);
+            g.reduceClipRegion (clip);
         }
 
-        const auto isMuted = processor.getParameters().getRawParameterValue (
-                                 StagMotionBandsAudioProcessor::muteParameterId (band))->load() >= 0.5f;
-        const auto isSoloed = processor.getParameters().getRawParameterValue (
-                                  StagMotionBandsAudioProcessor::soloParameterId (band))->load() >= 0.5f;
-
-        if (isMuted)
+        // Band states sit under everything else.
+        for (int band = 0; band < bandCount; ++band)
         {
-            g.setColour (destructive.withAlpha (0.14f));
-            g.fillRect (bandArea);
+            const auto area = juce::Rectangle<float>::leftTopRightBottom (
+                edges[static_cast<size_t> (band)], plot.getY(),
+                edges[static_cast<size_t> (band + 1)], plot.getBottom());
+            const auto muted = parameterIsOn (processor, StagMotionBandsAudioProcessor::muteParameterId (band));
+            const auto soloed = parameterIsOn (processor, StagMotionBandsAudioProcessor::soloParameterId (band));
+
+            if (band == selectedBand)
+            {
+                g.setColour (cream.withAlpha (0.09f));
+                g.fillRect (area);
+            }
+
+            if (soloed)
+            {
+                g.setColour (apricot.withAlpha (0.12f));
+                g.fillRect (area);
+            }
+
+            if (muted)
+            {
+                g.setColour (ink.withAlpha (0.45f));
+                g.fillRect (area);
+                g.setColour (cream.withAlpha (0.06f));
+                for (auto x = area.getX() - area.getHeight(); x < area.getRight(); x += 12.0f)
+                    g.drawLine (x, area.getBottom(), x + area.getHeight(), area.getY(), 1.0f);
+            }
+
+            if (band == selectedBand || soloed)
+            {
+                g.setColour (band == selectedBand ? cream : apricot);
+                g.fillRect (area.withHeight (3.0f).reduced (1.0f, 0.0f));
+            }
         }
-        else if (isSoloed)
+
+        // Grid.
+        for (const auto frequency : frequencyLines)
         {
-            g.setColour (accent.withAlpha (0.12f));
-            g.fillRect (bandArea);
+            g.setColour (cream.withAlpha (0.08f));
+            g.drawVerticalLine (juce::roundToInt (frequencyToX (frequency)), plot.getY(), plot.getBottom());
         }
-    }
 
-    const std::array<float, 10> frequencyLines {
-        20.0f, 50.0f, 100.0f, 200.0f, 500.0f,
-        1000.0f, 2000.0f, 5000.0f, 10000.0f, 20000.0f
-    };
-
-    g.setFont (12.0f);
-    for (const auto frequency : frequencyLines)
-    {
-        const auto x = frequencyToX (frequency);
-        g.setColour (grid);
-        g.drawVerticalLine (juce::roundToInt (x), plot.getY(), plot.getBottom());
-        g.setColour (mutedText);
-        g.drawText (formatFrequency (frequency),
-                    juce::Rectangle<float> { x - 24.0f, plot.getBottom() + 3.0f, 48.0f, 16.0f },
-                    juce::Justification::centred, false);
-    }
-
-    const std::array<float, 5> dbLines { -12.0f, -24.0f, -48.0f, -72.0f, -96.0f };
-    for (const auto db : dbLines)
-    {
-        const auto normalized = juce::jmap (db, -100.0f, 0.0f, 1.0f, 0.0f);
-        const auto y = plot.getY() + normalized * plot.getHeight();
-        g.setColour (grid);
-        g.drawHorizontalLine (juce::roundToInt (y), plot.getX(), plot.getRight());
-    }
-
-    juce::Path spectrumPath;
-    bool started = false;
-    const auto currentSampleRate = processor.getSampleRate() > 0.0 ? processor.getSampleRate() : 44100.0;
-    for (int bin = 1; bin < fftSize / 2; ++bin)
-    {
-        const auto frequency = static_cast<float> (bin) * static_cast<float> (currentSampleRate)
-                             / static_cast<float> (fftSize);
-        if (frequency < minimumFrequency || frequency > maximumFrequency)
-            continue;
-
-        const auto x = frequencyToX (frequency);
-        const auto normalized = juce::jmap (spectrumDb[static_cast<size_t> (bin)], -100.0f, 0.0f, 1.0f, 0.0f);
-        const auto y = plot.getY() + juce::jlimit (0.0f, 1.0f, normalized) * plot.getHeight();
-
-        if (! started)
+        const std::array<float, 4> dbLines { -24.0f, -48.0f, -72.0f, -96.0f };
+        for (const auto db : dbLines)
         {
-            spectrumPath.startNewSubPath (x, y);
-            started = true;
+            const auto y = plot.getY() + juce::jmap (db, floorDb, 0.0f, 1.0f, 0.0f) * plot.getHeight();
+            g.setColour (cream.withAlpha (0.08f));
+            g.drawHorizontalLine (juce::roundToInt (y), plot.getX(), plot.getRight());
         }
-        else
-        {
-            spectrumPath.lineTo (x, y);
-        }
-    }
 
-    if (! spectrumPath.isEmpty())
-    {
+        // Spectrum.
+        juce::Path spectrumPath;
+        for (int point = 0; point < displayPoints; ++point)
+        {
+            const auto proportion = static_cast<float> (point) / static_cast<float> (displayPoints - 1);
+            const auto x = plot.getX() + proportion * plot.getWidth();
+            const auto normalized = juce::jmap (displayDb[static_cast<size_t> (point)], floorDb, 0.0f, 1.0f, 0.0f);
+            const auto y = plot.getY() + juce::jlimit (0.0f, 1.0f, normalized) * plot.getHeight();
+
+            if (point == 0)
+                spectrumPath.startNewSubPath (x, y);
+            else
+                spectrumPath.lineTo (x, y);
+        }
+
         auto fillPath = spectrumPath;
         fillPath.lineTo (plot.getRight(), plot.getBottom());
         fillPath.lineTo (plot.getX(), plot.getBottom());
         fillPath.closeSubPath();
-
         g.setGradientFill (juce::ColourGradient {
-            accent.withAlpha (0.28f), plot.getCentreX(), plot.getY(),
-            accent.withAlpha (0.01f), plot.getCentreX(), plot.getBottom(), false
+            lilac.withAlpha (0.42f), plot.getCentreX(), plot.getY() + plot.getHeight() * 0.25f,
+            lilac.withAlpha (0.04f), plot.getCentreX(), plot.getBottom(), false
         });
         g.fillPath (fillPath);
-        g.setColour (accent.withAlpha (0.92f));
-        g.strokePath (spectrumPath, juce::PathStrokeType { 1.8f });
+        g.setColour (cream.withAlpha (0.95f));
+        g.strokePath (spectrumPath, juce::PathStrokeType { 1.6f, juce::PathStrokeType::curved,
+                                                           juce::PathStrokeType::rounded });
+
+        if (mouseInside && draggingSeparator < 0 && hoveredSeparator < 0)
+        {
+            g.setColour (cream.withAlpha (0.35f));
+            g.drawVerticalLine (juce::roundToInt (frequencyToX (hoveredFrequency)), plot.getY(), plot.getBottom());
+        }
+
+        // Band names and their effects.
+        for (int band = 0; band < bandCount; ++band)
+        {
+            const auto left = edges[static_cast<size_t> (band)];
+            const auto right = edges[static_cast<size_t> (band + 1)];
+            const auto width = right - left;
+            const auto selected = band == selectedBand;
+            const auto muted = parameterIsOn (processor, StagMotionBandsAudioProcessor::muteParameterId (band));
+            const auto effect = juce::jlimit (0, EffectMenuPanel::numEffects - 1, currentEffect (processor, band));
+            const auto labelArea = juce::Rectangle<float> (left + 6.0f, plot.getY() + 14.0f, width - 12.0f, 18.0f);
+
+            g.setFont (theme.semibold (14.0f));
+            g.setColour (selected ? cream : mutedViolet);
+            g.drawFittedText (width >= 70.0f ? "Band " + juce::String (band + 1) : juce::String (band + 1),
+                              labelArea.toNearestInt(), juce::Justification::centred, 1, 0.8f);
+
+            if (width >= 70.0f)
+            {
+                const auto detail = muted ? juce::String ("Muted")
+                                          : effect == 0 ? juce::String ("No effect") : names[static_cast<size_t> (effect)];
+                g.setFont (theme.regular (12.0f));
+                g.setColour (selected ? cream.withAlpha (0.85f) : mutedViolet.withAlpha (0.8f));
+                g.drawFittedText (detail, labelArea.translated (0.0f, 18.0f).toNearestInt(),
+                                  juce::Justification::centred, 1, 0.8f);
+            }
+        }
+
+        // Crossover dividers.
+        for (int index = 0; index < bandCount - 1; ++index)
+        {
+            const auto frequency = crossovers[static_cast<size_t> (index)];
+            const auto x = frequencyToX (frequency);
+            const auto highlighted = index == draggingSeparator || index == hoveredSeparator;
+
+            g.setColour (highlighted ? apricot : cream.withAlpha (0.75f));
+            g.drawLine (x, plot.getY(), x, plot.getBottom(), highlighted ? 2.4f : 1.4f);
+
+            const auto label = formatFrequency (frequency);
+            const auto pill = juce::Rectangle<float> (x - 26.0f, plot.getCentreY() - 12.0f, 52.0f, 24.0f);
+            g.setColour (highlighted ? apricot : cream);
+            g.fillRoundedRectangle (pill, 12.0f);
+            g.setColour (ink);
+            g.setFont (theme.numeric (12.0f));
+            g.drawText (label, pill, juce::Justification::centred, false);
+        }
     }
 
-    for (int index = 0; index < bandCount - 1; ++index)
+    // Frequency axis.
+    g.setFont (theme.numeric (11.0f));
+    for (size_t line = 0; line < frequencyLines.size(); ++line)
     {
-        const auto frequency = crossovers[static_cast<size_t> (index)];
+        const auto frequency = frequencyLines[line];
         const auto x = frequencyToX (frequency);
-        const auto highlighted = index == draggingSeparator || index == hoveredSeparator;
+        auto labelArea = juce::Rectangle<float> { x - 24.0f, plot.getBottom() + 6.0f, 48.0f, 14.0f };
+        auto justification = juce::Justification::centred;
+        if (line == 0)
+        {
+            labelArea.setX (plot.getX() + 4.0f);
+            justification = juce::Justification::centredLeft;
+        }
+        else if (line == frequencyLines.size() - 1)
+        {
+            labelArea.setRight (plot.getRight() - 4.0f);
+            labelArea.setX (labelArea.getRight() - 48.0f);
+            justification = juce::Justification::centredRight;
+        }
 
-        g.setColour (highlighted ? accentHover : text.withAlpha (0.64f));
-        g.drawLine (x, plot.getY(), x, plot.getBottom(), highlighted ? 2.5f : 1.4f);
-        g.fillEllipse (x - 5.0f, plot.getY() + 8.0f, 10.0f, 10.0f);
-
-        const auto label = formatFrequency (frequency);
-        const auto labelArea = juce::Rectangle<float> { x - 34.0f, plot.getY() + 23.0f, 68.0f, 22.0f };
-        g.setColour (background.withAlpha (0.84f));
-        g.fillRoundedRectangle (labelArea, 5.0f);
-        g.setColour (text);
-        g.drawText (label, labelArea, juce::Justification::centred, false);
-    }
-
-    for (int band = 0; band < bandCount; ++band)
-    {
-        const auto centreX = (edges[static_cast<size_t> (band)] + edges[static_cast<size_t> (band + 1)]) * 0.5f;
-        g.setColour (band == selectedBand ? accent : mutedText);
-        g.setFont (juce::FontOptions { 12.0f, juce::Font::bold });
-        g.drawText ("BAND " + juce::String (band + 1),
-                    juce::Rectangle<float> { centreX - 38.0f, plot.getY() + 8.0f, 76.0f, 16.0f },
-                    juce::Justification::centred, false);
-    }
-
-    if (mouseInside && draggingSeparator < 0)
-    {
-        const auto x = frequencyToX (hoveredFrequency);
-        g.setColour (accentSoft);
-        g.drawVerticalLine (juce::roundToInt (x), plot.getY(), plot.getBottom());
+        g.setColour (mutedViolet);
+        g.drawText (formatFrequency (frequency), labelArea, justification, false);
     }
 }
 
@@ -272,32 +342,37 @@ void SpectrumBandEditor::updateBandButtons()
 {
     const auto plot = plotBounds();
     const auto bandCount = processor.getBandCount();
-    const auto crossovers = processor.getSortedCrossovers();
 
     if (selectedBand >= bandCount)
         selectBand (bandCount - 1);
 
-    std::array<float, StagMotionBandsAudioProcessor::maxBands + 1> edges {};
-    edges[0] = plot.getX();
-    for (int index = 0; index < bandCount - 1; ++index)
-        edges[static_cast<size_t> (index + 1)] = frequencyToX (crossovers[static_cast<size_t> (index)]);
-    edges[static_cast<size_t> (bandCount)] = plot.getRight();
+    const auto edges = bandEdges();
 
     for (int band = 0; band < StagMotionBandsAudioProcessor::maxBands; ++band)
     {
         const auto visible = band < bandCount;
+        const auto canRemove = visible && bandCount > 1;
         soloButtons[static_cast<size_t> (band)].setVisible (visible);
         muteButtons[static_cast<size_t> (band)].setVisible (visible);
-        removeButtons[static_cast<size_t> (band)].setVisible (visible && bandCount > 1);
+        removeButtons[static_cast<size_t> (band)].setVisible (canRemove);
 
         if (! visible)
             continue;
 
+        constexpr int buttonWidth = 28;
+        constexpr int buttonHeight = 24;
+        constexpr int gap = 4;
+        const auto count = canRemove ? 3 : 2;
+        const auto groupWidth = count * buttonWidth + (count - 1) * gap;
         const auto centreX = (edges[static_cast<size_t> (band)] + edges[static_cast<size_t> (band + 1)]) * 0.5f;
-        const auto y = juce::roundToInt (plot.getBottom() - 34.0f);
-        soloButtons[static_cast<size_t> (band)].setBounds (juce::roundToInt (centreX) - 45, y, 26, 24);
-        muteButtons[static_cast<size_t> (band)].setBounds (juce::roundToInt (centreX) - 13, y, 26, 24);
-        removeButtons[static_cast<size_t> (band)].setBounds (juce::roundToInt (centreX) + 19, y, 26, 24);
+        auto x = juce::roundToInt (centreX) - groupWidth / 2;
+        const auto y = juce::roundToInt (plot.getBottom() - 12.0f) - buttonHeight;
+
+        soloButtons[static_cast<size_t> (band)].setBounds (x, y, buttonWidth, buttonHeight);
+        x += buttonWidth + gap;
+        muteButtons[static_cast<size_t> (band)].setBounds (x, y, buttonWidth, buttonHeight);
+        x += buttonWidth + gap;
+        removeButtons[static_cast<size_t> (band)].setBounds (x, y, buttonWidth, buttonHeight);
     }
 }
 
@@ -430,12 +505,47 @@ void SpectrumBandEditor::updateSpectrum()
     window.multiplyWithWindowingTable (fftData.data(), fftSize);
     fft.performFrequencyOnlyForwardTransform (fftData.data());
 
-    for (int bin = 1; bin < fftSize / 2; ++bin)
+    // Display on a log-spaced grid with 1/6-octave smoothing so the high end
+    // reads as a calm curve rather than a wall of FFT bins.
+    const auto sampleRate = processor.getSampleRate() > 0.0 ? processor.getSampleRate() : 44100.0;
+    const auto binWidth = static_cast<float> (sampleRate) / static_cast<float> (fftSize);
+    const auto halfWidth = std::pow (2.0f, 1.0f / 12.0f);
+    constexpr int lastBin = fftSize / 2 - 1;
+
+    for (int point = 0; point < displayPoints; ++point)
     {
-        const auto magnitude = fftData[static_cast<size_t> (bin)] / static_cast<float> (fftSize);
-        const auto value = juce::Decibels::gainToDecibels (magnitude, -100.0f);
-        auto& smoothed = spectrumDb[static_cast<size_t> (bin)];
-        smoothed = value > smoothed ? value : juce::jmax (-100.0f, smoothed - 1.8f);
+        const auto proportion = static_cast<float> (point) / static_cast<float> (displayPoints - 1);
+        const auto frequency = minimumFrequency * std::pow (maximumFrequency / minimumFrequency, proportion);
+        const auto lowBin = juce::jlimit (1, lastBin, static_cast<int> (std::floor (frequency / halfWidth / binWidth)));
+        const auto highBin = juce::jlimit (lowBin, lastBin, static_cast<int> (std::ceil (frequency * halfWidth / binWidth)));
+
+        auto power = 0.0f;
+        if (highBin - lowBin < 3)
+        {
+            // Below a few bins per point, interpolate between neighbouring
+            // bins so the low end is a curve rather than a staircase.
+            const auto exactBin = juce::jlimit (1.0f, static_cast<float> (lastBin - 1), frequency / binWidth);
+            const auto lower = static_cast<int> (exactBin);
+            const auto fraction = exactBin - static_cast<float> (lower);
+            const auto a = fftData[static_cast<size_t> (lower)] / static_cast<float> (fftSize);
+            const auto b = fftData[static_cast<size_t> (lower + 1)] / static_cast<float> (fftSize);
+            const auto magnitude = a + (b - a) * fraction;
+            power = magnitude * magnitude;
+        }
+        else
+        {
+            for (int bin = lowBin; bin <= highBin; ++bin)
+            {
+                const auto magnitude = fftData[static_cast<size_t> (bin)] / static_cast<float> (fftSize);
+                power += magnitude * magnitude;
+            }
+
+            power /= static_cast<float> (highBin - lowBin + 1);
+        }
+
+        const auto value = juce::Decibels::gainToDecibels (std::sqrt (power), floorDb);
+        auto& smoothed = displayDb[static_cast<size_t> (point)];
+        smoothed = value > smoothed ? value : juce::jmax (floorDb, smoothed - 1.8f);
     }
 }
 
@@ -486,20 +596,22 @@ juce::String SpectrumBandEditor::formatFrequency (float frequency) const
     return juce::String (juce::roundToInt (frequency));
 }
 
+//==============================================================================
+const std::array<juce::String, EffectMenuPanel::numEffects>& EffectMenuPanel::effectNames()
+{
+    static const std::array<juce::String, numEffects> names {
+        "Off", "Chorus", "Flanger", "Phaser", "Tremolo",
+        "Auto pan", "Ring mod", "Phase warp", "Freq shift"
+    };
+    return names;
+}
+
 EffectMenuPanel::EffectMenuPanel (StagMotionBandsAudioProcessor& owner)
     : processor (owner)
 {
-    title.setText ("EFFECT", juce::dontSendNotification);
-    title.setFont (juce::FontOptions { 11.0f, juce::Font::bold });
-    title.setColour (juce::Label::textColourId, mutedText);
-    title.setJustificationType (juce::Justification::centredLeft);
-    addAndMakeVisible (title);
+    setTitle ("Effect");
 
-    const std::array<juce::String, 9> names {
-        "OFF", "CHORUS", "FLANGER", "PHASER", "TREMOLO",
-        "AUTO PAN", "RING MOD", "PHASE WARP", "FREQ SHIFT"
-    };
-    const std::array<juce::String, 9> tooltips {
+    const std::array<juce::String, numEffects> tooltips {
         "Disable modulation for the selected band",
         "Add animated width and pitch movement",
         "Create short comb-filter sweeps",
@@ -511,15 +623,13 @@ EffectMenuPanel::EffectMenuPanel (StagMotionBandsAudioProcessor& owner)
         "Shift every frequency by a fixed amount"
     };
 
-    for (int index = 0; index < static_cast<int> (effectButtons.size()); ++index)
+    for (int index = 0; index < numEffects; ++index)
     {
         auto& button = effectButtons[static_cast<size_t> (index)];
-        button.setButtonText (names[static_cast<size_t> (index)]);
+        button.setButtonText (effectNames()[static_cast<size_t> (index)]);
         button.setTooltip (tooltips[static_cast<size_t> (index)]);
-        button.setColour (juce::TextButton::buttonColourId, panel);
-        button.setColour (juce::TextButton::buttonOnColourId, accentPressed);
-        button.setColour (juce::TextButton::textColourOffId, mutedText);
-        button.setColour (juce::TextButton::textColourOnId, text);
+        button.setRadioGroupId (0x5354);
+        button.getProperties().set (StagProperties::segment, true);
         button.onClick = [this, index] { chooseEffect (index); };
         addAndMakeVisible (button);
     }
@@ -528,28 +638,33 @@ EffectMenuPanel::EffectMenuPanel (StagMotionBandsAudioProcessor& owner)
     startTimerHz (20);
 }
 
-void EffectMenuPanel::paint (juce::Graphics& g)
-{
-    g.setColour (panelRaised);
-    g.fillRoundedRectangle (getLocalBounds().toFloat(), 16.0f);
-    g.setColour (grid);
-    g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (0.5f), 16.0f, 1.0f);
-}
-
 void EffectMenuPanel::resized()
 {
-    auto bounds = getLocalBounds().reduced (14);
-    title.setBounds (bounds.removeFromTop (24));
-    bounds.removeFromTop (8);
+    auto bounds = getLocalBounds();
+    constexpr int gap = 6;
+    const auto count = static_cast<int> (effectButtons.size());
 
-    constexpr int buttonGap = 4;
-    const auto buttonHeight = juce::jmax (
-        24, (bounds.getHeight() - buttonGap * (static_cast<int> (effectButtons.size()) - 1))
-                / static_cast<int> (effectButtons.size()));
-    for (auto& button : effectButtons)
+    // One row when there is room, otherwise two rows so every effect stays reachable.
+    const auto rows = bounds.getWidth() >= 9 * 74 + 8 * gap ? 1 : 2;
+    const auto perRow = (count + rows - 1) / rows;
+    const auto rowHeight = (bounds.getHeight() - (rows - 1) * gap) / rows;
+
+    for (int row = 0; row < rows; ++row)
     {
-        button.setBounds (bounds.removeFromTop (buttonHeight));
-        bounds.removeFromTop (buttonGap);
+        auto rowArea = bounds.removeFromTop (rowHeight);
+        bounds.removeFromTop (gap);
+        const auto first = row * perRow;
+        const auto last = juce::jmin (count, first + perRow);
+        const auto inRow = last - first;
+        const auto buttonWidth = (rowArea.getWidth() - (perRow - 1) * gap) / perRow;
+
+        for (int index = first; index < last; ++index)
+        {
+            const auto isLastInRow = index == last - 1 && inRow == perRow;
+            effectButtons[static_cast<size_t> (index)].setBounds (
+                isLastInRow ? rowArea : rowArea.removeFromLeft (buttonWidth));
+            rowArea.removeFromLeft (gap);
+        }
     }
 }
 
@@ -579,70 +694,47 @@ void EffectMenuPanel::timerCallback()
 
 void EffectMenuPanel::updateButtons()
 {
-    const auto effect = static_cast<int> (std::lround (
-        processor.getParameters().getRawParameterValue (
-            StagMotionBandsAudioProcessor::effectTypeParameterId (selectedBand))->load()));
+    const auto effect = currentEffect (processor, selectedBand);
 
     for (int index = 0; index < static_cast<int> (effectButtons.size()); ++index)
         effectButtons[static_cast<size_t> (index)].setToggleState (
             index == effect, juce::dontSendNotification);
 }
 
-BandControlPanel::BandControlPanel (StagMotionBandsAudioProcessor& owner)
-    : processor (owner)
+//==============================================================================
+BandControlPanel::BandControlPanel (StagMotionBandsAudioProcessor& owner, EffectMenuPanel& menu)
+    : processor (owner), effectMenu (menu)
 {
-    bandTitle.setText ("BAND 1", juce::dontSendNotification);
-    bandTitle.setFont (juce::FontOptions { 15.0f, juce::Font::bold });
-    bandTitle.setColour (juce::Label::textColourId, accent);
+    bandTitle.setText ("Band 1", juce::dontSendNotification);
+    bandTitle.setColour (juce::Label::textColourId, ink);
+    bandTitle.setBorderSize ({});
 
-    waveformLabel.setText ("WAVE", juce::dontSendNotification);
-    waveformLabel.setFont (juce::FontOptions { 10.0f, juce::Font::bold });
-    waveformLabel.setColour (juce::Label::textColourId, mutedText);
+    bandRange.setColour (juce::Label::textColourId, mutedInk);
+    bandRange.setBorderSize ({});
 
-    divisionLabel.setText ("DIVISION", juce::dontSendNotification);
-    divisionLabel.setFont (juce::FontOptions { 10.0f, juce::Font::bold });
-    divisionLabel.setColour (juce::Label::textColourId, mutedText);
+    configureFieldLabel (effectLabel, "Effect");
+    configureFieldLabel (sourceLabel, "Source");
+    configureFieldLabel (waveformLabel, "Wave");
+    configureFieldLabel (divisionLabel, "Division");
 
-    sourceLabel.setText ("SOURCE", juce::dontSendNotification);
-    sourceLabel.setFont (juce::FontOptions { 10.0f, juce::Font::bold });
-    sourceLabel.setColour (juce::Label::textColourId, mutedText);
-
-    triggerLabel.setText ("MIDI", juce::dontSendNotification);
-    triggerLabel.setFont (juce::FontOptions { 10.0f, juce::Font::bold });
-    triggerLabel.setColour (juce::Label::textColourId, mutedText);
-
-    waveformSelector.addItemList ({ "SINE", "TRIANGLE", "SAW", "SQUARE" }, 1);
+    waveformSelector.addItemList ({ "Sine", "Triangle", "Saw", "Square" }, 1);
     divisionSelector.addItemList ({ "1/32", "1/16", "1/8", "1/4", "1/2", "1/1", "2/1" }, 1);
-    sourceSelector.addItemList ({ "LFO", "ENVELOPE" }, 1);
-
-    for (auto* selector : { &waveformSelector, &divisionSelector, &sourceSelector })
-    {
-        selector->setColour (juce::ComboBox::backgroundColourId, panel);
-        selector->setColour (juce::ComboBox::textColourId, text);
-        selector->setColour (juce::ComboBox::outlineColourId, grid);
-        selector->setColour (juce::ComboBox::arrowColourId, accent);
-    }
+    sourceSelector.addItemList ({ "LFO", "Envelope" }, 1);
 
     waveformSelector.setTooltip ("LFO waveform for the selected band");
-    divisionSelector.setTooltip ("Musical cycle length when tempo sync is enabled");
+    divisionSelector.setTooltip ("Musical cycle length when Project sync is on");
     sourceSelector.setTooltip ("Choose the modulation signal for the selected band");
 
-    syncButton.setButtonText ("PROJECT SYNC");
+    syncButton.setButtonText ("Project sync");
     syncButton.setClickingTogglesState (true);
-    syncButton.setColour (juce::ToggleButton::textColourId, text);
-    syncButton.setColour (juce::ToggleButton::tickColourId, accent);
-    syncButton.setColour (juce::ToggleButton::tickDisabledColourId, disabledText);
     syncButton.setTooltip ("Replace free-rate Hz with divisions locked to the project tempo");
 
-    retriggerButton.setButtonText ("RETRIGGER");
+    retriggerButton.setButtonText ("MIDI retrigger");
     retriggerButton.setClickingTogglesState (true);
-    retriggerButton.setColour (juce::ToggleButton::textColourId, text);
-    retriggerButton.setColour (juce::ToggleButton::tickColourId, accent);
-    retriggerButton.setColour (juce::ToggleButton::tickDisabledColourId, disabledText);
     retriggerButton.setTooltip ("Reset this band's LFO phase when a MIDI note starts");
 
     const std::array<juce::String, 8> labels {
-        "RATE", "DEPTH", "FEEDBACK", "MIX", "STEREO", "ATTACK", "RELEASE", "FREQUENCY"
+        "Rate", "Depth", "Feedback", "Mix", "Stereo", "Attack", "Release", "Frequency"
     };
     for (int index = 0; index < 8; ++index)
         configureSlider (parameterSliders[static_cast<size_t> (index)],
@@ -659,7 +751,7 @@ BandControlPanel::BandControlPanel (StagMotionBandsAudioProcessor& owner)
         };
 
     parameterSliders[4].textFromValueFunction = [] (double value) {
-        return juce::String (juce::roundToInt (value * 180.0)) + " deg";
+        return juce::String (juce::roundToInt (value * 180.0)) + juce::String::fromUTF8 ("\xc2\xb0");
     };
 
     for (int index = 5; index < 7; ++index)
@@ -671,11 +763,16 @@ BandControlPanel::BandControlPanel (StagMotionBandsAudioProcessor& owner)
         return juce::String (value, value < 100.0 ? 1 : 0) + " Hz";
     };
 
+    for (auto& slider : parameterSliders)
+        slider.updateText();
+
     addAndMakeVisible (bandTitle);
+    addAndMakeVisible (bandRange);
+    addAndMakeVisible (effectLabel);
+    addAndMakeVisible (effectMenu);
     addAndMakeVisible (waveformLabel);
     addAndMakeVisible (divisionLabel);
     addAndMakeVisible (sourceLabel);
-    addAndMakeVisible (triggerLabel);
     addAndMakeVisible (waveformSelector);
     addAndMakeVisible (divisionSelector);
     addAndMakeVisible (sourceSelector);
@@ -683,25 +780,27 @@ BandControlPanel::BandControlPanel (StagMotionBandsAudioProcessor& owner)
     addAndMakeVisible (retriggerButton);
 
     rebuildAttachments();
+    updateBandRange();
     updateControlVisibility();
     startTimerHz (30);
+}
+
+void BandControlPanel::configureFieldLabel (juce::Label& label, const juce::String& labelText)
+{
+    label.setText (labelText, juce::dontSendNotification);
+    label.getProperties().set (StagProperties::fieldLabel, true);
+    label.setColour (juce::Label::textColourId, mutedInk);
+    label.setBorderSize ({});
 }
 
 void BandControlPanel::configureSlider (juce::Slider& slider, juce::Label& label, const juce::String& labelText)
 {
     slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-    slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 76, 20);
+    slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 84, 28);
     slider.setNumDecimalPlacesToDisplay (2);
-    slider.setColour (juce::Slider::rotarySliderFillColourId, accent);
-    slider.setColour (juce::Slider::rotarySliderOutlineColourId, grid);
-    slider.setColour (juce::Slider::thumbColourId, text);
-    slider.setColour (juce::Slider::textBoxTextColourId, text);
-    slider.setColour (juce::Slider::textBoxBackgroundColourId, panel);
-    slider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+    slider.setTitle (labelText);
 
-    label.setText (labelText, juce::dontSendNotification);
-    label.setFont (juce::FontOptions { 10.0f, juce::Font::bold });
-    label.setColour (juce::Label::textColourId, mutedText);
+    configureFieldLabel (label, labelText);
     label.setJustificationType (juce::Justification::centred);
 
     addAndMakeVisible (slider);
@@ -715,8 +814,9 @@ void BandControlPanel::selectBand (int bandIndex)
         return;
 
     selectedBand = clamped;
-    bandTitle.setText ("BAND " + juce::String (selectedBand + 1), juce::dontSendNotification);
+    bandTitle.setText ("Band " + juce::String (selectedBand + 1), juce::dontSendNotification);
     rebuildAttachments();
+    updateBandRange();
     updateControlVisibility();
     repaint();
 }
@@ -765,43 +865,68 @@ void BandControlPanel::rebuildAttachments()
                 parameterSliders[static_cast<size_t> (index)]);
 }
 
+void BandControlPanel::updateBandRange()
+{
+    const auto bandCount = processor.getBandCount();
+    const auto crossovers = processor.getSortedCrossovers();
+    const auto band = juce::jmin (selectedBand, bandCount - 1);
+    const auto low = band == 0 ? minimumFrequency : crossovers[static_cast<size_t> (band - 1)];
+    const auto high = band == bandCount - 1 ? maximumFrequency : crossovers[static_cast<size_t> (band)];
+    const auto text = formatHz (low) + juce::String::fromUTF8 (" \xe2\x80\x93 ") + formatHz (high);
+
+    if (bandRange.getText() != text)
+        bandRange.setText (text, juce::dontSendNotification);
+}
+
+juce::Rectangle<int> BandControlPanel::activityMeterBounds() const
+{
+    return { getWidth() - 24 - 140, 31, 140, 6 };
+}
+
 void BandControlPanel::paint (juce::Graphics& g)
 {
-    g.setColour (panelRaised);
-    g.fillRoundedRectangle (getLocalBounds().toFloat(), 14.0f);
-    g.setColour (grid);
-    g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (0.5f), 14.0f, 1.0f);
+    auto& theme = themeOf (*this);
+    g.fillAll (cream);
 
-    const auto dividerX = 340.0f;
-    g.drawVerticalLine (juce::roundToInt (dividerX), 20.0f, static_cast<float> (getHeight() - 20));
+    // Live modulation activity for the selected band.
+    const auto meter = activityMeterBounds().toFloat();
+    g.setFont (theme.semibold (12.0f));
+    g.setColour (mutedInk);
+    g.drawText ("Motion", meter.withX (meter.getX() - 60.0f).withWidth (52.0f).withY (meter.getCentreY() - 8.0f).withHeight (16.0f),
+                juce::Justification::centredRight, false);
+    g.setColour (lilac);
+    g.fillRoundedRectangle (meter, 3.0f);
+    g.setColour (apricot.darker (0.1f));
+    g.fillRoundedRectangle (meter.withWidth (meter.getWidth() * juce::jlimit (0.0f, 1.0f, displayedActivity)), 3.0f);
 
-    const juce::Rectangle<float> meterArea { 244.0f, 25.0f, 68.0f, 5.0f };
-    g.setColour (grid);
-    g.fillRoundedRectangle (meterArea, 2.5f);
-    g.setColour (accent.withAlpha (0.9f));
-    g.fillRoundedRectangle (meterArea.withWidth (meterArea.getWidth() * displayedActivity), 2.5f);
+    if (dividerX > 0)
+    {
+        g.setColour (border.withAlpha (0.35f));
+        g.drawVerticalLine (dividerX, static_cast<float> (knobArea.getY()), static_cast<float> (knobArea.getBottom()));
+    }
 
     if (displayedEffect == BandModulationEngine::off)
     {
-        g.setColour (mutedText);
-        g.setFont (juce::FontOptions { 12.0f, juce::Font::bold });
-        g.drawText ("SELECT AN EFFECT TO SHOW ITS ESSENTIAL CONTROLS",
-                    getLocalBounds().toFloat().withTrimmedLeft (370.0f),
-                    juce::Justification::centred, false);
+        g.setFont (theme.semibold (16.0f));
+        g.setColour (ink);
+        g.drawText ("Band " + juce::String (selectedBand + 1) + " is unprocessed.",
+                    knobArea.withTrimmedBottom (knobArea.getHeight() / 2).withTrimmedBottom (4),
+                    juce::Justification::centredBottom, false);
+        g.setFont (theme.regular (14.0f));
+        g.setColour (mutedInk);
+        g.drawText ("Choose an effect above to start shaping it.",
+                    knobArea.withTrimmedTop (knobArea.getHeight() / 2).withTrimmedTop (4),
+                    juce::Justification::centredTop, false);
     }
 }
 
 void BandControlPanel::updateControlVisibility()
 {
-    const auto effect = static_cast<int> (std::lround (
-        processor.getParameters().getRawParameterValue (
-            StagMotionBandsAudioProcessor::effectTypeParameterId (selectedBand))->load()));
+    const auto effect = currentEffect (processor, selectedBand);
     const auto source = static_cast<int> (std::lround (
         processor.getParameters().getRawParameterValue (
             StagMotionBandsAudioProcessor::modulationSourceParameterId (selectedBand))->load()));
-    const auto tempoSync = processor.getParameters().getRawParameterValue (
-                               StagMotionBandsAudioProcessor::syncParameterId (selectedBand))->load()
-                           >= 0.5f;
+    const auto tempoSync = parameterIsOn (processor, StagMotionBandsAudioProcessor::syncParameterId (selectedBand));
     const auto effectEnabled = effect != BandModulationEngine::off;
     const auto usesCarrier = effect == BandModulationEngine::ringMod
                           || effect == BandModulationEngine::frequencyShifter;
@@ -815,7 +940,6 @@ void BandControlPanel::updateControlVisibility()
     sourceSelector.setVisible (effectEnabled && ! usesCarrier);
     waveformLabel.setVisible (showsWaveform);
     waveformSelector.setVisible (showsWaveform);
-    triggerLabel.setVisible (usesOscillator);
     retriggerButton.setVisible (usesOscillator);
     divisionLabel.setVisible (usesOscillator && tempoSync);
     divisionSelector.setVisible (usesOscillator && tempoSync);
@@ -848,12 +972,12 @@ void BandControlPanel::updateControlVisibility()
     }
 
     parameterLabels[1].setText (
-        effect == BandModulationEngine::phaseWarp ? "WARP"
-          : effect == BandModulationEngine::autoPan ? "PAN"
-                                                     : "DEPTH",
+        effect == BandModulationEngine::phaseWarp ? "Warp"
+          : effect == BandModulationEngine::autoPan ? "Pan"
+                                                     : "Depth",
         juce::dontSendNotification);
     parameterLabels[7].setText (
-        effect == BandModulationEngine::frequencyShifter ? "SHIFT" : "CARRIER",
+        effect == BandModulationEngine::frequencyShifter ? "Shift" : "Carrier",
         juce::dontSendNotification);
 
     for (int index = 0; index < static_cast<int> (parameterSliders.size()); ++index)
@@ -875,124 +999,148 @@ void BandControlPanel::timerCallback()
 {
     const auto target = processor.getModulationActivity (selectedBand);
     displayedActivity += (target - displayedActivity) * 0.28f;
-    repaint (240, 20, 78, 16);
+    repaint (activityMeterBounds().expanded (2));
+    updateBandRange();
 
-    const auto effect = static_cast<int> (std::lround (
-        processor.getParameters().getRawParameterValue (
-            StagMotionBandsAudioProcessor::effectTypeParameterId (selectedBand))->load()));
+    const auto effect = currentEffect (processor, selectedBand);
     const auto source = static_cast<int> (std::lround (
         processor.getParameters().getRawParameterValue (
             StagMotionBandsAudioProcessor::modulationSourceParameterId (selectedBand))->load()));
-    const auto tempoSync = processor.getParameters().getRawParameterValue (
-                               StagMotionBandsAudioProcessor::syncParameterId (selectedBand))->load()
-                           >= 0.5f;
+    const auto tempoSync = parameterIsOn (processor, StagMotionBandsAudioProcessor::syncParameterId (selectedBand));
     if (effect != displayedEffect || source != displayedSource || tempoSync != displayedSync)
         updateControlVisibility();
 }
 
 void BandControlPanel::resized()
 {
-    auto bounds = getLocalBounds().reduced (20, 14);
-    auto identity = bounds.removeFromLeft (300);
-    bandTitle.setBounds (identity.removeFromTop (26));
-    identity.removeFromTop (4);
+    auto& theme = themeOf (*this);
+    bandTitle.setFont (theme.semibold (22.0f));
+    bandRange.setFont (theme.regular (14.0f));
 
-    auto labelsRow = identity.removeFromTop (16);
-    sourceLabel.setBounds (labelsRow.removeFromLeft (134));
-    labelsRow.removeFromLeft (10);
-    waveformLabel.setBounds (labelsRow);
+    auto bounds = getLocalBounds().reduced (24, 0);
+    bounds.removeFromTop (18);
 
-    auto selectorsRow = identity.removeFromTop (32);
-    sourceSelector.setBounds (selectorsRow.removeFromLeft (134));
-    selectorsRow.removeFromLeft (10);
-    waveformSelector.setBounds (selectorsRow);
+    auto titleRow = bounds.removeFromTop (30);
+    bandTitle.setBounds (titleRow.removeFromLeft (96));
+    bandRange.setBounds (titleRow.removeFromLeft (220));
 
-    identity.removeFromTop (5);
-    auto sourceLabels = identity.removeFromTop (16);
-    triggerLabel.setBounds (sourceLabels.removeFromLeft (134));
-    sourceLabels.removeFromLeft (10);
-    divisionLabel.setBounds (sourceLabels);
+    bounds.removeFromTop (14);
+    effectLabel.setBounds (bounds.removeFromTop (16));
+    bounds.removeFromTop (6);
+    const auto twoRows = bounds.getWidth() < 9 * 74 + 8 * 6;
+    effectMenu.setBounds (bounds.removeFromTop (twoRows ? 78 : 40));
 
-    auto sourceRow = identity.removeFromTop (32);
-    retriggerButton.setBounds (sourceRow.removeFromLeft (134));
-    sourceRow.removeFromLeft (10);
-    divisionSelector.setBounds (sourceRow);
+    bounds.removeFromTop (18);
+    bounds.removeFromBottom (18);
 
-    identity.removeFromTop (5);
-    auto syncRow = identity.removeFromTop (32);
-    syncButton.setBounds (syncRow.removeFromLeft (134));
+    // Modulation settings on the left, the effect's knobs on the right.
+    const auto showsSettings = sourceSelector.isVisible() || waveformSelector.isVisible()
+                            || syncButton.isVisible() || retriggerButton.isVisible();
+    knobArea = bounds;
+    dividerX = -1;
 
-    bounds.removeFromLeft (42);
+    if (showsSettings)
+    {
+        auto settings = bounds.removeFromLeft (juce::jlimit (230, 320, bounds.getWidth() * 34 / 100));
+        dividerX = settings.getRight() + 20;
+        bounds.removeFromLeft (40);
+        knobArea = bounds;
+
+        constexpr int gap = 10;
+        constexpr int labelHeight = 16;
+        constexpr int controlHeight = 34;
+        const auto half = (settings.getWidth() - gap) / 2;
+
+        auto placePair = [&] (juce::Component* firstLabel, juce::Component* first,
+                              juce::Component* secondLabel, juce::Component* second)
+        {
+            const auto firstVisible = first != nullptr && first->isVisible();
+            const auto secondVisible = second != nullptr && second->isVisible();
+            if (! firstVisible && ! secondVisible)
+                return;
+
+            const auto hasLabels = (firstLabel != nullptr && firstVisible) || (secondLabel != nullptr && secondVisible);
+            auto labels = hasLabels ? settings.removeFromTop (labelHeight + 4) : juce::Rectangle<int>();
+            auto controls = settings.removeFromTop (controlHeight);
+            settings.removeFromTop (12);
+
+            auto place = [&] (juce::Component* label, juce::Component* control, bool fullWidth)
+            {
+                auto labelCell = fullWidth ? labels : labels.removeFromLeft (half);
+                auto controlCell = fullWidth ? controls : controls.removeFromLeft (half);
+                if (label != nullptr)
+                    label->setBounds (labelCell.withHeight (labelHeight));
+                control->setBounds (controlCell);
+            };
+
+            if (firstVisible && secondVisible)
+            {
+                place (firstLabel, first, false);
+                labels.removeFromLeft (gap);
+                controls.removeFromLeft (gap);
+                place (secondLabel, second, true);
+            }
+            else if (firstVisible)
+                place (firstLabel, first, false);
+            else
+                place (secondLabel, second, false);
+        };
+
+        placePair (&sourceLabel, &sourceSelector, &waveformLabel, &waveformSelector);
+        placePair (nullptr, &syncButton, nullptr, &retriggerButton);
+    }
+
     std::vector<int> visibleSliderIndices;
     for (int index = 0; index < static_cast<int> (parameterSliders.size()); ++index)
         if (parameterSliders[static_cast<size_t> (index)].isVisible())
             visibleSliderIndices.push_back (index);
 
-    if (visibleSliderIndices.empty())
+    // When Project sync is on, Division takes the place of the Rate (or
+    // Carrier) knob, so it sits in the same row as the other timing controls.
+    const auto showsDivision = divisionSelector.isVisible();
+    const auto count = static_cast<int> (visibleSliderIndices.size()) + (showsDivision ? 1 : 0);
+    if (count == 0)
         return;
 
-    const auto sliderWidth = juce::jmax (
-        82, bounds.getWidth() / static_cast<int> (visibleSliderIndices.size()));
-    for (int position = 0; position < static_cast<int> (visibleSliderIndices.size()); ++position)
+    const auto columnWidth = juce::jmin (130, knobArea.getWidth() / count);
+    auto row = knobArea.withSizeKeepingCentre (columnWidth * count, knobArea.getHeight());
+    if (showsSettings)
+        row.setX (knobArea.getX());
+
+    if (showsDivision)
     {
-        const auto index = visibleSliderIndices[static_cast<size_t> (position)];
-        auto column = bounds.removeFromLeft (
-            position == static_cast<int> (visibleSliderIndices.size()) - 1
-                ? bounds.getWidth()
-                : sliderWidth);
+        auto column = row.removeFromLeft (columnWidth);
+        divisionLabel.setJustificationType (juce::Justification::centred);
+        divisionLabel.setBounds (column.removeFromTop (18));
+        column.removeFromTop (4);
+        divisionSelector.setBounds (column.reduced (8, 0).withSizeKeepingCentre (column.getWidth() - 16, 34));
+    }
+
+    for (const auto index : visibleSliderIndices)
+    {
+        auto column = row.removeFromLeft (columnWidth);
         parameterLabels[static_cast<size_t> (index)].setBounds (column.removeFromTop (18));
-        parameterSliders[static_cast<size_t> (index)].setBounds (column.reduced (6, 0));
+        column.removeFromTop (4);
+        parameterSliders[static_cast<size_t> (index)].setBounds (column.reduced (8, 0));
     }
 }
 
+//==============================================================================
 StagMotionBandsAudioProcessorEditor::StagMotionBandsAudioProcessorEditor (
     StagMotionBandsAudioProcessor& owner)
     : AudioProcessorEditor (&owner), ownerProcessor (owner), spectrumEditor (owner), effectMenu (owner),
-      bandControls (owner)
+      bandControls (owner, effectMenu)
 {
-    stagLookAndFeel.setColour (juce::PopupMenu::backgroundColourId, panelRaised);
-    stagLookAndFeel.setColour (juce::PopupMenu::textColourId, text);
-    stagLookAndFeel.setColour (juce::PopupMenu::highlightedBackgroundColourId, accent);
-    stagLookAndFeel.setColour (juce::PopupMenu::highlightedTextColourId, background);
-    stagLookAndFeel.setColour (juce::TooltipWindow::backgroundColourId, panelRaised);
-    stagLookAndFeel.setColour (juce::TooltipWindow::textColourId, text);
-    stagLookAndFeel.setColour (juce::TooltipWindow::outlineColourId, grid);
-    stagLookAndFeel.setColour (juce::ComboBox::focusedOutlineColourId, accentHover);
     setLookAndFeel (&stagLookAndFeel);
+    mark = juce::Drawable::createFromImageData (BinaryData::stagmark_svg, BinaryData::stagmark_svgSize);
 
     setOpaque (true);
     setWantsKeyboardFocus (true);
     setResizable (true, true);
     setResizeLimits (760, 600, 1600, 1050);
-    setSize (1100, 900);
+    setSize (1100, 820);
 
-    productName.setText ("MOTION / BANDS", juce::dontSendNotification);
-    productName.setFont (juce::FontOptions { 24.0f, juce::Font::bold });
-    productName.setColour (juce::Label::textColourId, text);
-
-    productDescriptor.setText ("MULTIBAND MODULATION WORKSPACE", juce::dontSendNotification);
-    productDescriptor.setFont (juce::FontOptions { 11.0f, juce::Font::bold });
-    productDescriptor.setColour (juce::Label::textColourId, mutedText);
-
-    interactionHint.setText (
-        "DOUBLE-CLICK TO SPLIT  /  DRAG DIVIDERS  /  ARROW KEYS SWITCH BANDS",
-        juce::dontSendNotification);
-    interactionHint.setFont (juce::FontOptions { 11.0f });
-    interactionHint.setColour (juce::Label::textColourId, mutedText);
-    interactionHint.setJustificationType (juce::Justification::centredRight);
-
-    buildBadge.setText ("ALPHA 0.7", juce::dontSendNotification);
-    buildBadge.setFont (juce::FontOptions { 11.0f, juce::Font::bold });
-    buildBadge.setColour (juce::Label::textColourId, background);
-    buildBadge.setColour (juce::Label::backgroundColourId, accent);
-    buildBadge.setJustificationType (juce::Justification::centred);
-
-    addAndMakeVisible (productName);
-    addAndMakeVisible (productDescriptor);
-    addAndMakeVisible (interactionHint);
-    addAndMakeVisible (buildBadge);
     addAndMakeVisible (spectrumEditor);
-    addAndMakeVisible (effectMenu);
     addAndMakeVisible (bandControls);
 
     spectrumEditor.setBandSelectedCallback ([this] (int band) {
@@ -1006,47 +1154,52 @@ StagMotionBandsAudioProcessorEditor::~StagMotionBandsAudioProcessorEditor()
     setLookAndFeel (nullptr);
 }
 
+int StagMotionBandsAudioProcessorEditor::deckTop() const
+{
+    const auto deckHeight = getWidth() < 9 * 74 + 8 * 6 + 48 ? 352 : 314;
+    return getHeight() - deckHeight;
+}
+
 void StagMotionBandsAudioProcessorEditor::paint (juce::Graphics& g)
 {
-    const auto fullBounds = getLocalBounds().toFloat();
-    g.setGradientFill (juce::ColourGradient {
-        background, fullBounds.getTopLeft(), deepPlum, fullBounds.getBottomRight(), false
-    });
-    g.fillRect (fullBounds);
+    g.fillAll (violet);
 
-    auto bounds = fullBounds;
-    g.setColour (grid);
-    g.drawHorizontalLine (86, bounds.getX() + 28.0f, bounds.getRight() - 28.0f);
+    if (mark != nullptr)
+        mark->drawWithin (g, { 24.0f, 12.0f, 36.0f, 44.0f }, juce::RectanglePlacement::centred, 1.0f);
 
-    const auto footer = bounds.removeFromBottom (64.0f).reduced (28.0f, 0.0f);
-    g.setColour (mutedText);
-    g.setFont (11.0f);
-    g.drawText ("STAG AUDIO  /  EXPANDED EFFECTS MILESTONE",
-                footer, juce::Justification::centredLeft, false);
-    g.drawText ("VST3  /  AU  /  STANDALONE",
-                footer, juce::Justification::centredRight, false);
+    g.setFont (stagLookAndFeel.semibold (24.0f));
+    g.setColour (cream);
+    g.drawText ("Stag Motion Bands", juce::Rectangle<int> (72, 10, 320, 30), juce::Justification::centredLeft, false);
+    g.setFont (stagLookAndFeel.regular (13.0f));
+    g.setColour (cream.withAlpha (0.85f));
+    g.drawText ("Stag Audio  " + juce::String::fromUTF8 ("\xc2\xb7") + "  Multiband modulation",
+                juce::Rectangle<int> (72, 38, 320, 18), juce::Justification::centredLeft, false);
+
+    const auto badge = juce::Rectangle<float> (static_cast<float> (getWidth()) - 24.0f - 86.0f, 21.0f, 86.0f, 26.0f);
+    g.setColour (apricot);
+    g.fillRoundedRectangle (badge, 13.0f);
+    g.setColour (ink);
+    g.setFont (stagLookAndFeel.semibold (12.0f));
+    g.drawText ("Alpha " + juce::String (JucePlugin_VersionString).upToLastOccurrenceOf (".", false, false),
+                badge, juce::Justification::centred, false);
+
+    if (getWidth() >= 960)
+    {
+        g.setFont (stagLookAndFeel.regular (13.0f));
+        g.setColour (mutedViolet);
+        g.drawText ("Double-click to add a band  " + juce::String::fromUTF8 ("\xc2\xb7")
+                        + "  Drag dividers  " + juce::String::fromUTF8 ("\xc2\xb7")
+                        + "  " + juce::String::fromUTF8 ("\xe2\x86\x90 \xe2\x86\x92") + " switch bands",
+                    juce::Rectangle<int> (400, 21, getWidth() - 400 - 24 - 86 - 20, 26),
+                    juce::Justification::centredRight, false);
+    }
 }
 
 void StagMotionBandsAudioProcessorEditor::resized()
 {
-    auto bounds = getLocalBounds().reduced (28);
-    auto header = bounds.removeFromTop (58);
-
-    auto brand = header.removeFromLeft (280);
-    productName.setBounds (brand.removeFromTop (34));
-    productDescriptor.setBounds (brand);
-
-    buildBadge.setBounds (header.removeFromRight (86).reduced (0, 15));
-    interactionHint.setBounds (header.reduced (12, 0));
-
-    bounds.removeFromTop (28);
-    bounds.removeFromBottom (48);
-    auto controls = bounds.removeFromBottom (232);
-    auto analysisArea = bounds.withTrimmedBottom (18);
-    effectMenu.setBounds (analysisArea.removeFromRight (154));
-    analysisArea.removeFromRight (12);
-    spectrumEditor.setBounds (analysisArea);
-    bandControls.setBounds (controls);
+    const auto top = deckTop();
+    spectrumEditor.setBounds (16, 68, getWidth() - 32, top - 68 - 14);
+    bandControls.setBounds (0, top, getWidth(), getHeight() - top);
 }
 
 bool StagMotionBandsAudioProcessorEditor::keyPressed (const juce::KeyPress& key)

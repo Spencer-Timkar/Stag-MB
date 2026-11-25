@@ -14,7 +14,7 @@ Early JUCE implementation of a multiband modulation plug-in. The current milesto
 - Selected-band controls for effect type, rate, depth, feedback, wet/dry mix, and stereo spread
 - Smoothed modulation parameters to reduce zipper noise during automation
 - DAW-automatable and recallable band, modulation, crossover, Solo, and Mute parameters
-- Stag brand palette: near-black and ivory surfaces with a single Stag Violet accent
+- Stag brand interface shared with Stag Limiter: violet workspace, cream control deck, Inter type and apricot active states
 - Per-band LFO or envelope-follower modulation sources
 - Adjustable envelope attack and release with a live source activity meter
 - Optional per-band LFO phase retrigger from incoming MIDI note-on messages
