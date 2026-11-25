@@ -29,7 +29,8 @@ public:
     enum ModulationSource
     {
         lfo = 0,
-        envelope
+        envelope,
+        transient
     };
 
     struct Settings
@@ -42,9 +43,11 @@ public:
         float feedback = 0.0f;
         float mix = 0.5f;
         float stereoSpread = 0.5f;
-        float attackMs = 20.0f;
+        float attackMs = 5.0f;
         float releaseMs = 180.0f;
         float carrierHz = 80.0f;
+        float thresholdDb = -36.0f;
+        float rangeDb = 18.0f;
     };
 
     void prepare (const juce::dsp::ProcessSpec& spec)
@@ -59,6 +62,8 @@ public:
         phaserFeedback.assign (static_cast<size_t> (channelCount), 0.0f);
         stageCoefficients.assign (static_cast<size_t> (channelCount), {});
         hilbertFilters.assign (static_cast<size_t> (channelCount), {});
+        fastReleaseCoefficient = timeCoefficient (transientFastReleaseMs);
+        averageCoefficient = timeCoefficient (transientAverageMs);
 
         for (auto* value : { &rate, &depth, &feedback, &mix, &spread, &carrierRate })
             value->reset (sampleRate, 0.025);
@@ -87,7 +92,11 @@ public:
         writePosition = 0;
         phase = 0.0;
         carrierPhase = 0.0;
-        envelopeValue = 0.0f;
+        levelDb = detectorFloorDb;
+        fastLevel = 0.0f;
+        averageDb = detectorFloorDb;
+        transientRiseDb = 0.0f;
+        followerModulation = -1.0f;
         activity = 0.0f;
         coefficientCountdown = 0;
         coefficientEffect = -1;
@@ -125,7 +134,8 @@ public:
         const auto channelsToProcess = juce::jmin (channelCount, buffer.getNumChannels());
         const auto attackCoefficient = timeCoefficient (settings.attackMs);
         const auto releaseCoefficient = timeCoefficient (settings.releaseMs);
-        const auto usesEnvelope = settings.modulationSource == envelope;
+        const auto usesFollower = settings.modulationSource == envelope
+                               || settings.modulationSource == transient;
 
         if (settings.effectType != coefficientEffect)
         {
@@ -147,15 +157,14 @@ public:
             const auto refreshCoefficients = coefficientCountdown == 0;
             coefficientCountdown = refreshCoefficients ? coefficientInterval - 1 : coefficientCountdown - 1;
 
-            float detectorInput = 0.0f;
-            for (int channel = 0; channel < channelsToProcess; ++channel)
-                detectorInput = juce::jmax (detectorInput, std::abs (buffer.getSample (channel, sample)));
+            if (usesFollower)
+            {
+                float detectorInput = 0.0f;
+                for (int channel = 0; channel < channelsToProcess; ++channel)
+                    detectorInput = juce::jmax (detectorInput, std::abs (buffer.getSample (channel, sample)));
 
-            const auto envelopeCoefficient = detectorInput > envelopeValue
-                                                 ? attackCoefficient
-                                                 : releaseCoefficient;
-            envelopeValue = detectorInput + envelopeCoefficient * (envelopeValue - detectorInput);
-            const auto envelopeModulation = usesEnvelope ? envelopeToModulation (envelopeValue) : 0.0f;
+                updateFollower (detectorInput, settings, attackCoefficient, releaseCoefficient);
+            }
 
             for (int channel = 0; channel < channelsToProcess; ++channel)
             {
@@ -168,7 +177,7 @@ public:
                                                        / static_cast<float> (channelsToProcess - 1);
                 const auto channelPhase = wrapPhase (static_cast<float> (phase)
                                                      + channelPosition * currentSpread * 0.5f);
-                const auto modulation = usesEnvelope ? envelopeModulation
+                const auto modulation = usesFollower ? followerModulation
                                                      : waveformValue (channelPhase, settings.waveform);
                 const auto input = buffer.getSample (channel, sample);
                 const auto carrierChannelPhase = wrapPhase (
@@ -284,7 +293,7 @@ public:
         const auto usesCarrier = settings.effectType == ringMod
                               || settings.effectType == frequencyShifter;
         const auto bipolarActivity = usesCarrier  ? waveformValue (static_cast<float> (carrierPhase), sine)
-                                   : usesEnvelope ? envelopeToModulation (envelopeValue)
+                                   : usesFollower ? followerModulation
                                                   : waveformValue (static_cast<float> (phase), settings.waveform);
         activity = juce::jlimit (0.0f, 1.0f, bipolarActivity * 0.5f + 0.5f);
     }
@@ -313,14 +322,6 @@ public:
         const auto magnitude = static_cast<double> (juce::jlimit (0.0f, 0.99f, std::abs (feedback)));
         const auto passes = magnitude > 0.0 ? std::ceil (std::log (0.001) / std::log (magnitude)) : 1.0;
         return passes * static_cast<double> (chorusBaseDelayMs + chorusExcursionMs) * 0.001;
-    }
-
-    // Maps the follower level in dB onto the bipolar modulation range: -48 dBFS and below
-    // is -1, -24 dBFS is 0 and 0 dBFS is +1, so quiet bands still swing the modulation.
-    static float envelopeToModulation (float level)
-    {
-        constexpr auto floorDb = -48.0f;
-        return juce::jlimit (-1.0f, 1.0f, 1.0f + juce::Decibels::gainToDecibels (level, floorDb) * (2.0f / -floorDb));
     }
 
 private:
@@ -393,6 +394,41 @@ private:
         float delayedInPhase = 0.0f;
     };
 
+    // Both followers work on the band's peak level in dB, so Attack and Release are time
+    // constants of the modulation itself, and Threshold/Range place the swing.
+    //   Envelope:  the level, clamped at Threshold, smoothed with Attack/Release; Threshold
+    //              maps to -1 and Threshold + Range to +1.
+    //   Transient: how far a quick level (Attack, fixed fast release) jumps above its own
+    //              recent average or Threshold, whichever is higher; that rise is held and
+    //              decays with Release. No rise maps to -1, a rise of Range dB to +1. The
+    //              quick level is smoothed linearly, so zero crossings barely dent it.
+    void updateFollower (float peak, const Settings& settings, float attackCoefficient, float releaseCoefficient) noexcept
+    {
+        const auto inputDb = juce::Decibels::gainToDecibels (peak, detectorFloorDb);
+        const auto thresholdDb = settings.thresholdDb;
+        const auto rangeDb = juce::jmax (1.0f, settings.rangeDb);
+
+        const auto follow = [] (float& state, float target, float riseCoefficient, float fallCoefficient)
+        {
+            state = target + (target > state ? riseCoefficient : fallCoefficient) * (state - target);
+        };
+
+        if (settings.modulationSource == envelope)
+        {
+            levelDb = juce::jmax (levelDb, thresholdDb);
+            follow (levelDb, juce::jmax (inputDb, thresholdDb), attackCoefficient, releaseCoefficient);
+            followerModulation = 2.0f * juce::jlimit (0.0f, 1.0f, (levelDb - thresholdDb) / rangeDb) - 1.0f;
+            return;
+        }
+
+        follow (fastLevel, peak, attackCoefficient, fastReleaseCoefficient);
+        const auto fastDb = juce::Decibels::gainToDecibels (fastLevel, detectorFloorDb);
+        follow (averageDb, fastDb, averageCoefficient, averageCoefficient);
+        const auto rise = juce::jmax (0.0f, fastDb - juce::jmax (averageDb, thresholdDb));
+        follow (transientRiseDb, rise, 0.0f, releaseCoefficient);
+        followerModulation = 2.0f * juce::jlimit (0.0f, 1.0f, transientRiseDb / rangeDb) - 1.0f;
+    }
+
     float allpassCoefficient (float frequency) const
     {
         const auto tangent = std::tan (juce::MathConstants<float>::pi * frequency
@@ -446,6 +482,9 @@ private:
     static constexpr float flangerExcursionMs = 1.9f;
     static constexpr int phaserStageCount = 6;
     static constexpr int coefficientInterval = 8;
+    static constexpr float detectorFloorDb = -100.0f;
+    static constexpr float transientFastReleaseMs = 30.0f;
+    static constexpr float transientAverageMs = 250.0f;
 
     double sampleRate = 0.0;
     int channelCount = 0;
@@ -453,7 +492,13 @@ private:
     int writePosition = 0;
     double phase = 0.0;
     double carrierPhase = 0.0;
-    float envelopeValue = 0.0f;
+    float levelDb = detectorFloorDb;        // Envelope: band level, smoothed in dB
+    float fastLevel = 0.0f;                 // Transient: quick linear level
+    float averageDb = detectorFloorDb;      // Transient: recent average of the quick level
+    float transientRiseDb = 0.0f;           // Transient: held rise of quick level over the average
+    float followerModulation = -1.0f;
+    float fastReleaseCoefficient = 0.0f;
+    float averageCoefficient = 0.0f;
     float activity = 0.0f;
     int coefficientCountdown = 0;
     int coefficientEffect = -1;

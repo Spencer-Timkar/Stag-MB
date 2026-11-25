@@ -55,6 +55,8 @@ StagMotionBandsAudioProcessor::StagMotionBandsAudioProcessor()
         pointers.release = parameters.getRawParameterValue (releaseParameterId (band));
         pointers.retrigger = parameters.getRawParameterValue (retriggerParameterId (band));
         pointers.carrierFrequency = parameters.getRawParameterValue (carrierFrequencyParameterId (band));
+        pointers.threshold = parameters.getRawParameterValue (thresholdParameterId (band));
+        pointers.range = parameters.getRawParameterValue (rangeParameterId (band));
     }
 }
 
@@ -170,7 +172,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout StagMotionBandsAudioProcesso
         result.push_back (std::make_unique<juce::AudioParameterChoice> (
             juce::ParameterID { modulationSourceParameterId (band), 1 },
             "Band " + juce::String (band + 1) + " Modulation Source",
-            juce::StringArray { "LFO", "Envelope" },
+            juce::StringArray { "LFO", "Envelope", "Transient" },
             0));
 
         juce::NormalisableRange<float> attackRange { 1.0f, 500.0f, 0.1f };
@@ -179,7 +181,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout StagMotionBandsAudioProcesso
             juce::ParameterID { attackParameterId (band), 1 },
             "Band " + juce::String (band + 1) + " Envelope Attack",
             attackRange,
-            20.0f,
+            5.0f,
             juce::AudioParameterFloatAttributes()
                 .withLabel ("ms")
                 .withStringFromValueFunction ([] (float value, int) {
@@ -215,6 +217,28 @@ juce::AudioProcessorValueTreeState::ParameterLayout StagMotionBandsAudioProcesso
                 .withLabel ("Hz")
                 .withStringFromValueFunction ([] (float value, int) {
                     return juce::String (value, value < 100.0f ? 1 : 0) + " Hz";
+                })));
+
+        result.push_back (std::make_unique<juce::AudioParameterFloat> (
+            juce::ParameterID { thresholdParameterId (band), 2 },
+            "Band " + juce::String (band + 1) + " Envelope Threshold",
+            juce::NormalisableRange<float> { -60.0f, 0.0f, 0.1f },
+            -36.0f,
+            juce::AudioParameterFloatAttributes()
+                .withLabel ("dB")
+                .withStringFromValueFunction ([] (float value, int) {
+                    return juce::String (value, 1) + " dB";
+                })));
+
+        result.push_back (std::make_unique<juce::AudioParameterFloat> (
+            juce::ParameterID { rangeParameterId (band), 2 },
+            "Band " + juce::String (band + 1) + " Envelope Range",
+            juce::NormalisableRange<float> { 3.0f, 48.0f, 0.1f },
+            18.0f,
+            juce::AudioParameterFloatAttributes()
+                .withLabel ("dB")
+                .withStringFromValueFunction ([] (float value, int) {
+                    return juce::String (value, 1) + " dB";
                 })));
     }
 
@@ -537,6 +561,8 @@ void StagMotionBandsAudioProcessor::applyBandEffect (int bandIndex, int numSampl
                           || effectType == BandModulationEngine::frequencyShifter;
     settings.carrierHz = tempoSync && usesCarrier ? BandModulationEngine::rateForDivision (transport.bpm, division)
                                                   : pointers.carrierFrequency->load();
+    settings.thresholdDb = pointers.threshold->load();
+    settings.rangeDb = pointers.range->load();
 
     auto& engine = modulationEngines[static_cast<size_t> (bandIndex)];
 
@@ -786,7 +812,9 @@ juce::StringArray StagMotionBandsAudioProcessor::bandParameterIds (int bandIndex
         attackParameterId (bandIndex),
         releaseParameterId (bandIndex),
         retriggerParameterId (bandIndex),
-        carrierFrequencyParameterId (bandIndex)
+        carrierFrequencyParameterId (bandIndex),
+        thresholdParameterId (bandIndex),
+        rangeParameterId (bandIndex)
     };
 }
 
@@ -873,6 +901,16 @@ juce::String StagMotionBandsAudioProcessor::retriggerParameterId (int bandIndex)
 juce::String StagMotionBandsAudioProcessor::carrierFrequencyParameterId (int bandIndex)
 {
     return "carrier" + juce::String (bandIndex + 1);
+}
+
+juce::String StagMotionBandsAudioProcessor::thresholdParameterId (int bandIndex)
+{
+    return "threshold" + juce::String (bandIndex + 1);
+}
+
+juce::String StagMotionBandsAudioProcessor::rangeParameterId (int bandIndex)
+{
+    return "range" + juce::String (bandIndex + 1);
 }
 
 void StagMotionBandsAudioProcessor::getStateInformation (juce::MemoryBlock& destinationData)

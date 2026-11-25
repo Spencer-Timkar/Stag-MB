@@ -131,8 +131,9 @@ private:
     juce::ComboBox sourceSelector;
     juce::ToggleButton syncButton;
     juce::ToggleButton retriggerButton;
-    std::array<juce::Slider, 8> parameterSliders;
-    std::array<juce::Label, 8> parameterLabels;
+    static constexpr int numKnobs = 10;
+    std::array<juce::Slider, numKnobs> parameterSliders;
+    std::array<juce::Label, numKnobs> parameterLabels;
     float displayedActivity = 0.0f;
     int displayedEffect = -1;
     int displayedSource = -1;
@@ -145,7 +146,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> sourceAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> syncAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> retriggerAttachment;
-    std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, 8> sliderAttachments;
+    std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, numKnobs> sliderAttachments;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BandControlPanel)
 };

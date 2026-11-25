@@ -79,6 +79,8 @@ public:
     static juce::String releaseParameterId (int bandIndex);
     static juce::String retriggerParameterId (int bandIndex);
     static juce::String carrierFrequencyParameterId (int bandIndex);
+    static juce::String thresholdParameterId (int bandIndex);
+    static juce::String rangeParameterId (int bandIndex);
 
 private:
     // Audio is processed in short sections so crossover glides, band gain ramps,
@@ -104,6 +106,8 @@ private:
         std::atomic<float>* release = nullptr;
         std::atomic<float>* retrigger = nullptr;
         std::atomic<float>* carrierFrequency = nullptr;
+        std::atomic<float>* threshold = nullptr;
+        std::atomic<float>* range = nullptr;
     };
 
     enum class LayoutFade { none, fadingOut, fadingIn };

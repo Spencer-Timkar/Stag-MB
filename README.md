@@ -15,9 +15,14 @@ Early JUCE implementation of a multiband modulation plug-in. The current milesto
 - Smoothed modulation parameters to reduce zipper noise during automation
 - DAW-automatable and recallable band, modulation, crossover, Solo, and Mute parameters
 - Stag brand interface shared with Stag Limiter: violet workspace, cream control deck, Inter type and apricot active states
-- Per-band LFO or envelope-follower modulation sources; the follower works in dB
-  (-48 dBFS to 0 dBFS spans the full modulation range), so quiet bands still move it
-- Adjustable envelope attack and release with a live source activity meter
+- Per-band LFO, Envelope, or Transient modulation sources:
+  - Envelope follows the band's level in dB; Threshold is the bottom of the swing and
+    Threshold + Range the top (defaults -36 dBFS and 18 dB)
+  - Transient reacts to hits that jump above the band's recent level, counting only the
+    part above Threshold, so hits drive the full swing whatever their level as long as
+    Threshold sits below them, while sustained sounds settle back down
+  - Attack and Release are time constants of the modulation itself (default 5 ms and
+    180 ms), with a live activity meter
 - Optional per-band LFO phase retrigger from incoming MIDI note-on messages
 - Streamlined four-band maximum with left/right arrow-key navigation
 - Double-click band creation and double-click divider removal
@@ -58,7 +63,8 @@ The project intentionally does not copy plug-ins into system folders after build
 The processor smoke suite exercises tempo mapping, every effect/waveform combination,
 state restoration, mute behavior, band settings following add/remove, a flat crossover
 sum, host blocks larger than announced, click-free edits, frequency-shifter image
-rejection, synced LFOs following the host position, envelope response to quiet bands,
+rejection, synced LFOs following the host position, the envelope window and release
+timing, a steady envelope on low tones, transient response to hits,
 a tail length that covers the longest feedback ring, and dragging the right crossover
 when automation has left them unsorted:
 

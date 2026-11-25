@@ -172,7 +172,7 @@ bool runEnvelopeActivitySmoke()
     buffer.clear();
     for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
         for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
-            buffer.setSample (channel, sample, 0.8f);
+            buffer.setSample (channel, sample, 0.06f); // -24 dBFS: inside the default -36..-18 dB window
 
     juce::MidiBuffer midi;
     midi.addEvent (juce::MidiMessage::noteOn (1, 60, static_cast<juce::uint8> (100)), 0);
@@ -560,31 +560,174 @@ bool runSyncedLfoFollowsHostTest()
     return true;
 }
 
-// The envelope follower works in dB, so a band peaking around -30 dBFS still moves it.
-bool runQuietEnvelopeStillModulatesTest()
+using Signal = std::function<float (long)>;
+
+// Activity of band 0 after every 32-sample block, so follower timing can be read at 0.7 ms resolution.
+std::vector<float> activityTrace (StagMotionBandsAudioProcessor& processor, const Signal& signal, double seconds)
 {
-    using Processor = StagMotionBandsAudioProcessor;
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 32;
+    processor.prepareToPlay (sampleRate, blockSize);
 
-    Processor processor;
-    setParameter (processor, Processor::modulationSourceParameterId (0), 1.0f);
-    setParameter (processor, Processor::attackParameterId (0), 1.0f);
-    processor.prepareToPlay (48000.0, 512);
-
-    juce::AudioBuffer<float> buffer (2, 512);
+    juce::AudioBuffer<float> buffer (2, blockSize);
     juce::MidiBuffer midi;
-    for (int block = 0; block < 40; ++block)
+    std::vector<float> trace;
+    long position = 0;
+
+    for (int block = 0; block < static_cast<int> (seconds * sampleRate / blockSize); ++block)
     {
-        for (int channel = 0; channel < 2; ++channel)
-            for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
-                buffer.setSample (channel, sample, 0.03f);
+        for (int sample = 0; sample < blockSize; ++sample, ++position)
+        {
+            const auto value = signal (position);
+            buffer.setSample (0, sample, value);
+            buffer.setSample (1, sample, value);
+        }
 
         processor.processBlock (buffer, midi);
+        trace.push_back (processor.getModulationActivity (0));
     }
 
-    const auto activity = processor.getModulationActivity (0);
-    if (activity < 0.3f)
+    return trace;
+}
+
+double traceSeconds (size_t index) { return static_cast<double> (index + 1) * 32.0 / 48000.0; }
+
+void useFollower (StagMotionBandsAudioProcessor& processor, int source, float thresholdDb, float rangeDb,
+                  float attackMs, float releaseMs)
+{
+    using Processor = StagMotionBandsAudioProcessor;
+    setParameter (processor, Processor::modulationSourceParameterId (0), static_cast<float> (source));
+    setParameter (processor, Processor::thresholdParameterId (0), thresholdDb);
+    setParameter (processor, Processor::rangeParameterId (0), rangeDb);
+    setParameter (processor, Processor::attackParameterId (0), attackMs);
+    setParameter (processor, Processor::releaseParameterId (0), releaseMs);
+}
+
+float sineAt (long position, float gainDb, double frequency)
+{
+    return juce::Decibels::decibelsToGain (gainDb)
+         * static_cast<float> (std::sin (juce::MathConstants<double>::twoPi * frequency * static_cast<double> (position) / 48000.0));
+}
+
+// Kick-like hits: a 55 Hz tone with a 3 ms rise and 120 ms decay, every 500 ms.
+float kickAt (long position, float peakDb)
+{
+    const auto time = std::fmod (static_cast<double> (position) / 48000.0, 0.5);
+    const auto envelope = std::min (1.0, time / 0.003) * std::exp (-time / 0.12);
+    return static_cast<float> (envelope) * sineAt (position, peakDb, 55.0);
+}
+
+// Threshold maps to the bottom of the modulation and Threshold + Range to the top.
+bool runEnvelopeWindowTest()
+{
+    struct Case { float thresholdDb, rangeDb, expectedActivity; };
+    const Case cases[] { { -40.0f, 20.0f, 0.5f }, { -30.0f, 20.0f, 0.0f }, { -45.0f, 10.0f, 1.0f }, { -36.0f, 24.0f, 0.25f } };
+
+    for (const auto& [thresholdDb, rangeDb, expected] : cases)
     {
-        std::cerr << "  -30 dBFS band only reaches activity " << activity << '\n';
+        StagMotionBandsAudioProcessor processor;
+        useFollower (processor, BandModulationEngine::envelope, thresholdDb, rangeDb, 1.0f, 100.0f);
+        const auto trace = activityTrace (processor, [] (long) { return juce::Decibels::decibelsToGain (-30.0f); }, 0.5);
+        if (std::abs (trace.back() - expected) > 0.03f)
+        {
+            std::cerr << "  -30 dBFS with threshold " << thresholdDb << " / range " << rangeDb
+                      << ": activity " << trace.back() << ", expected " << expected << '\n';
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// Release is a time constant of the modulation itself: 90 % -> 10 % takes ln 9 = 2.2 x Release.
+bool runEnvelopeReleaseMatchesSettingTest()
+{
+    for (const auto releaseMs : { 50.0f, 200.0f })
+    {
+        StagMotionBandsAudioProcessor processor;
+        useFollower (processor, BandModulationEngine::envelope, -36.0f, 18.0f, 5.0f, releaseMs);
+        const auto trace = activityTrace (processor, [] (long position) {
+            return position < 24000 ? sineAt (position, -6.0f, 1000.0) : 0.0f;
+        }, 2.0);
+
+        double fallsBelow90 = -1.0, fallsBelow10 = -1.0;
+        for (size_t index = 0; index < trace.size(); ++index)
+        {
+            if (traceSeconds (index) < 0.5)
+                continue;
+            if (fallsBelow90 < 0 && trace[index] < 0.9f)
+                fallsBelow90 = traceSeconds (index);
+            if (fallsBelow10 < 0 && trace[index] < 0.1f)
+                fallsBelow10 = traceSeconds (index);
+        }
+
+        const auto measuredMs = (fallsBelow10 - fallsBelow90) * 1000.0;
+        const auto expectedMs = std::log (9.0) * releaseMs;
+        if (fallsBelow90 < 0 || fallsBelow10 < 0 || std::abs (measuredMs - expectedMs) > expectedMs * 0.15)
+        {
+            std::cerr << "  release " << releaseMs << " ms: 90->10 % took " << measuredMs
+                      << " ms, expected about " << expectedMs << " ms\n";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// A steady low tone inside the window must give a steady envelope, not one that wobbles
+// with the waveform.
+bool runSteadyLowToneHoldsEnvelopeTest()
+{
+    StagMotionBandsAudioProcessor processor;
+    useFollower (processor, BandModulationEngine::envelope, -36.0f, 18.0f, 5.0f, 180.0f);
+    const auto trace = activityTrace (processor, [] (long position) { return sineAt (position, -27.0f, 60.0); }, 2.0);
+
+    const auto [lowest, highest] = std::minmax_element (trace.begin() + static_cast<long> (trace.size() / 2), trace.end());
+    if (*highest - *lowest > 0.1f || *lowest < 0.2f)
+    {
+        std::cerr << "  steady 60 Hz envelope moves between " << *lowest << " and " << *highest << '\n';
+        return false;
+    }
+
+    return true;
+}
+
+// Transient mode reacts to hits at any level, falls back between them, and ignores a
+// steady tone once it has settled.
+bool runTransientRespondsToHitsTest()
+{
+    for (const auto peakDb : { -6.0f, -30.0f })
+    {
+        StagMotionBandsAudioProcessor processor;
+        useFollower (processor, BandModulationEngine::transient, -60.0f, 18.0f, 5.0f, 100.0f);
+        const auto trace = activityTrace (processor, [peakDb] (long position) { return kickAt (position, peakDb); }, 4.0);
+
+        // Look at the hit at 3.0 s: the peak within 40 ms and the level just before 3.5 s.
+        float peakAfterHit = 0.0f, beforeNextHit = 1.0f;
+        for (size_t index = 0; index < trace.size(); ++index)
+        {
+            const auto seconds = traceSeconds (index);
+            if (seconds > 3.0 && seconds < 3.04)
+                peakAfterHit = juce::jmax (peakAfterHit, trace[index]);
+            if (seconds > 3.47 && seconds < 3.49)
+                beforeNextHit = trace[index];
+        }
+
+        if (peakAfterHit < 0.9f || beforeNextHit > 0.15f)
+        {
+            std::cerr << "  hits at " << peakDb << " dBFS: peak " << peakAfterHit
+                      << " within 40 ms, " << beforeNextHit << " before the next hit\n";
+            return false;
+        }
+    }
+
+    StagMotionBandsAudioProcessor processor;
+    useFollower (processor, BandModulationEngine::transient, -60.0f, 18.0f, 5.0f, 100.0f);
+    const auto trace = activityTrace (processor, [] (long position) { return sineAt (position, -12.0f, 1000.0); }, 2.0);
+    const auto settled = *std::max_element (trace.begin() + static_cast<long> (trace.size() * 3 / 4), trace.end());
+    if (settled > 0.1f)
+    {
+        std::cerr << "  steady tone still drives transient activity to " << settled << '\n';
         return false;
     }
 
@@ -724,7 +867,10 @@ int main()
         { "Edits do not click", runEditsDoNotClickTest },
         { "Frequency shifter rejects the image", runFrequencyShifterRejectsImageTest },
         { "Synced LFO follows the host", runSyncedLfoFollowsHostTest },
-        { "Quiet envelope still modulates", runQuietEnvelopeStillModulatesTest },
+        { "Envelope window follows Threshold and Range", runEnvelopeWindowTest },
+        { "Envelope release matches its setting", runEnvelopeReleaseMatchesSettingTest },
+        { "Steady low tone holds the envelope", runSteadyLowToneHoldsEnvelopeTest },
+        { "Transient responds to hits", runTransientRespondsToHitsTest },
         { "Tail covers the feedback ring", runTailCoversFeedbackRingTest },
         { "Crossover slot follows sorted order", runCrossoverSlotFollowsSortedOrderTest },
     };

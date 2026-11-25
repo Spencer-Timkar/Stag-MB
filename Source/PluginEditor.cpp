@@ -724,11 +724,12 @@ BandControlPanel::BandControlPanel (StagMotionBandsAudioProcessor& owner, Effect
 
     waveformSelector.addItemList ({ "Sine", "Triangle", "Saw", "Square" }, 1);
     divisionSelector.addItemList ({ "1/32", "1/16", "1/8", "1/4", "1/2", "1/1", "2/1" }, 1);
-    sourceSelector.addItemList ({ "LFO", "Envelope" }, 1);
+    sourceSelector.addItemList ({ "LFO", "Envelope", "Transient" }, 1);
 
     waveformSelector.setTooltip ("LFO waveform for the selected band");
     divisionSelector.setTooltip ("Musical cycle length when Project sync is on");
-    sourceSelector.setTooltip ("Choose the modulation signal for the selected band");
+    sourceSelector.setTooltip ("LFO: a free or synced oscillator. Envelope: follows the band's level. "
+                               "Transient: reacts to hits that jump above the band's recent level");
 
     syncButton.setButtonText ("Project sync");
     syncButton.setClickingTogglesState (true);
@@ -738,10 +739,10 @@ BandControlPanel::BandControlPanel (StagMotionBandsAudioProcessor& owner, Effect
     retriggerButton.setClickingTogglesState (true);
     retriggerButton.setTooltip ("Reset this band's LFO phase when a MIDI note starts");
 
-    const std::array<juce::String, 8> labels {
-        "Rate", "Depth", "Feedback", "Mix", "Stereo", "Attack", "Release", "Frequency"
+    const std::array<juce::String, numKnobs> labels {
+        "Rate", "Depth", "Feedback", "Mix", "Stereo", "Attack", "Release", "Frequency", "Threshold", "Range"
     };
-    for (int index = 0; index < 8; ++index)
+    for (int index = 0; index < numKnobs; ++index)
         configureSlider (parameterSliders[static_cast<size_t> (index)],
                          parameterLabels[static_cast<size_t> (index)],
                          labels[static_cast<size_t> (index)]);
@@ -767,6 +768,14 @@ BandControlPanel::BandControlPanel (StagMotionBandsAudioProcessor& owner, Effect
     parameterSliders[7].textFromValueFunction = [] (double value) {
         return juce::String (value, value < 100.0 ? 1 : 0) + " Hz";
     };
+
+    for (int index = 8; index < 10; ++index)
+        parameterSliders[static_cast<size_t> (index)].textFromValueFunction = [] (double value) {
+            return juce::String (value, 1) + " dB";
+        };
+
+    parameterSliders[8].setTooltip ("Level where the follower starts to move: at or below it the modulation rests at its minimum");
+    parameterSliders[9].setTooltip ("Envelope: dB above Threshold for full modulation. Transient: dB a hit must jump for full modulation");
 
     for (auto& slider : parameterSliders)
         slider.updateText();
@@ -852,7 +861,7 @@ void BandControlPanel::rebuildAttachments()
     retriggerAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
         state, StagMotionBandsAudioProcessor::retriggerParameterId (selectedBand), retriggerButton);
 
-    const std::array<juce::String, 8> parameterIds {
+    const std::array<juce::String, numKnobs> parameterIds {
         StagMotionBandsAudioProcessor::rateParameterId (selectedBand),
         StagMotionBandsAudioProcessor::depthParameterId (selectedBand),
         StagMotionBandsAudioProcessor::feedbackParameterId (selectedBand),
@@ -860,10 +869,12 @@ void BandControlPanel::rebuildAttachments()
         StagMotionBandsAudioProcessor::stereoSpreadParameterId (selectedBand),
         StagMotionBandsAudioProcessor::attackParameterId (selectedBand),
         StagMotionBandsAudioProcessor::releaseParameterId (selectedBand),
-        StagMotionBandsAudioProcessor::carrierFrequencyParameterId (selectedBand)
+        StagMotionBandsAudioProcessor::carrierFrequencyParameterId (selectedBand),
+        StagMotionBandsAudioProcessor::thresholdParameterId (selectedBand),
+        StagMotionBandsAudioProcessor::rangeParameterId (selectedBand)
     };
 
-    for (int index = 0; index < 8; ++index)
+    for (int index = 0; index < numKnobs; ++index)
         sliderAttachments[static_cast<size_t> (index)] =
             std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
                 state, parameterIds[static_cast<size_t> (index)],
@@ -936,7 +947,8 @@ void BandControlPanel::updateControlVisibility()
     const auto usesCarrier = effect == BandModulationEngine::ringMod
                           || effect == BandModulationEngine::frequencyShifter;
     const auto usesLfo = source == BandModulationEngine::lfo && ! usesCarrier;
-    const auto usesEnvelope = source == BandModulationEngine::envelope && ! usesCarrier;
+    const auto usesFollower = (source == BandModulationEngine::envelope || source == BandModulationEngine::transient)
+                           && ! usesCarrier;
     const auto isFrequencyShifter = effect == BandModulationEngine::frequencyShifter;
     const auto showsWaveform = effectEnabled && ! isFrequencyShifter && (usesCarrier || usesLfo);
     const auto usesOscillator = effectEnabled && (usesCarrier || usesLfo);
@@ -950,7 +962,7 @@ void BandControlPanel::updateControlVisibility()
     divisionSelector.setVisible (usesOscillator && tempoSync);
     syncButton.setVisible (usesOscillator);
 
-    std::array<bool, 8> visibleSliders {};
+    std::array<bool, numKnobs> visibleSliders {};
     if (effectEnabled)
     {
         visibleSliders[3] = true; // Mix
@@ -966,10 +978,12 @@ void BandControlPanel::updateControlVisibility()
 
         if (usesLfo)
             visibleSliders[0] = ! tempoSync; // Free-rate Hz is replaced by Division when synced.
-        else if (usesEnvelope)
+        else if (usesFollower)
         {
             visibleSliders[5] = true; // Attack
             visibleSliders[6] = true; // Release
+            visibleSliders[8] = true; // Threshold
+            visibleSliders[9] = true; // Range
         }
 
         if (usesCarrier)
