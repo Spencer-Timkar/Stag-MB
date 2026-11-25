@@ -41,9 +41,16 @@ public:
 
     int getBandCount() const noexcept;
     std::array<float, maxCrossovers> getSortedCrossovers() const;
+
+    // Band editing (message thread). Per-band settings move with their bands:
+    // addCrossover splits a band and both halves keep its settings; removeCrossover
+    // merges the two adjacent bands into the lower one; removeBand drops that band's
+    // settings (band 0 merges right, any other band merges into its lower neighbour).
     void addCrossover (float frequencyHz);
     void removeCrossover (int crossoverIndex);
     void removeBand (int bandIndex);
+
+    // Moves one crossover without a gesture; the caller (a drag) owns the gesture.
     void setCrossover (int crossoverIndex, float frequencyHz);
 
     int getAnalyzerSamplesAvailable() const noexcept;
@@ -69,21 +76,80 @@ public:
     static juce::String carrierFrequencyParameterId (int bandIndex);
 
 private:
+    // Audio is processed in short sections so crossover glides, band gain ramps,
+    // layout fades and MIDI retriggers land within this many samples, and so any
+    // host block size works without reallocation.
+    static constexpr int sectionSize = 32;
+
+    struct BandParameters
+    {
+        std::atomic<float>* mute = nullptr;
+        std::atomic<float>* solo = nullptr;
+        std::atomic<float>* effectType = nullptr;
+        std::atomic<float>* rate = nullptr;
+        std::atomic<float>* depth = nullptr;
+        std::atomic<float>* feedback = nullptr;
+        std::atomic<float>* mix = nullptr;
+        std::atomic<float>* sync = nullptr;
+        std::atomic<float>* division = nullptr;
+        std::atomic<float>* waveform = nullptr;
+        std::atomic<float>* stereoSpread = nullptr;
+        std::atomic<float>* modulationSource = nullptr;
+        std::atomic<float>* attack = nullptr;
+        std::atomic<float>* release = nullptr;
+        std::atomic<float>* retrigger = nullptr;
+        std::atomic<float>* carrierFrequency = nullptr;
+    };
+
+    enum class LayoutFade { none, fadingOut, fadingIn };
+
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+    static juce::StringArray bandParameterIds (int bandIndex);
+
+    void setParameterWithGesture (const juce::String& parameterId, float normalisedValue);
+    void setCrossoverWithGesture (int crossoverIndex, float frequencyHz);
+    void setBandCountWithGesture (int bandCount);
+    void copyBandSettings (int sourceBand, int destinationBand);
+    void removeBandAndCrossover (int droppedBand, int droppedCrossover);
+
     void pushAnalyzerSamples (const juce::AudioBuffer<float>& buffer);
-    void updateFilterCutoffs (const std::array<float, maxCrossovers>& frequencies, int numCrossovers);
+    void processSection (juce::AudioBuffer<float>& section, bool noteOn, double bpm);
+    bool targetLayoutDiffers() const noexcept;
+    void applyTargetLayout();
+    void updateCrossoverTargets();
+    void splitIntoBands (const juce::AudioBuffer<float>& section);
     void applyBandEffect (int bandIndex, int numSamples, double bpm);
+    bool anyBandSoloed() const noexcept;
+    bool bandIsAudible (int bandIndex, bool anySolo) const noexcept;
+    int readChoice (const std::atomic<float>* value) const noexcept;
 
     juce::AudioProcessorValueTreeState parameters;
+    std::atomic<float>* bandCountParameter = nullptr;
+    std::array<std::atomic<float>*, maxCrossovers> crossoverParameters {};
+    std::array<BandParameters, maxBands> bandParameters {};
 
     std::array<juce::dsp::LinkwitzRileyFilter<float>, maxCrossovers> lowPassFilters;
     std::array<juce::dsp::LinkwitzRileyFilter<float>, maxCrossovers> highPassFilters;
+    // allPassFilters[band][crossover], used for crossover > band: realigns the phase of
+    // lower bands with the higher splits so the bands sum flat.
+    std::array<std::array<juce::dsp::LinkwitzRileyFilter<float>, maxCrossovers>, maxCrossovers> allPassFilters;
+    std::array<juce::SmoothedValue<float, juce::ValueSmoothingTypes::Multiplicative>, maxCrossovers> crossoverSmoothers;
+    std::array<float, maxCrossovers> appliedCutoffs {};
+
     std::array<BandModulationEngine, maxBands> modulationEngines;
     std::array<std::atomic<float>, maxBands> modulationActivity {};
+    std::array<juce::SmoothedValue<float>, maxBands> bandGains;
     std::array<juce::AudioBuffer<float>, maxBands> bandBuffers;
     juce::AudioBuffer<float> remainingBuffer;
-    int preparedBlockSize = 0;
     int preparedChannels = 0;
+
+    // Layout = band count and per-band effect type. Changing either fades the output
+    // out on the old layout, switches with cleared filter/effect state, then fades in.
+    int appliedBandCount = 1;
+    std::array<int, maxBands> appliedEffects {};
+    LayoutFade layoutFade = LayoutFade::none;
+    float layoutGain = 1.0f;
+    float layoutFadeStep = 1.0f;
 
     std::array<float, analyzerCapacity> analyzerRing {};
     juce::AbstractFifo analyzerFifo { analyzerCapacity };

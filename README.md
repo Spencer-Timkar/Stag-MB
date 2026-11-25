@@ -21,7 +21,12 @@ Early JUCE implementation of a multiband modulation plug-in. The current milesto
 - Streamlined four-band maximum with left/right arrow-key navigation
 - Double-click band creation and double-click divider removal
 - Clickable effect sidebar with contextual, effect-specific minimal controls
-- Per-band × buttons that remove and merge bands without hunting for a divider
+- Per-band × buttons that remove and merge bands without hunting for a divider; a band's
+  effect and settings travel with it when bands are added or removed, and a new band
+  starts with the settings of the band it was split from
+- Phase-compensated Linkwitz-Riley crossovers: with every effect off the bands sum flat
+- Click-free edits: crossovers glide, Solo/Mute and effect changes ramp, and band-count
+  changes fade through silence
 - Per-band Tremolo with the same LFO, envelope, stereo, and mix architecture
 - Project Sync mode replaces free-rate Hz with musical note divisions
 - Auto Pan, Ring Mod, Phase Warp, and single-sideband Frequency Shifter engines
@@ -48,7 +53,8 @@ The project intentionally does not copy plug-ins into system folders after build
 ## Test
 
 The processor smoke suite exercises tempo mapping, every effect/waveform combination,
-state restoration, and mute behavior:
+state restoration, mute behavior, band settings following add/remove, a flat crossover
+sum, host blocks larger than announced, and click-free edits:
 
 ```sh
 cmake --build build --target StagMotionBandsTests -j 4

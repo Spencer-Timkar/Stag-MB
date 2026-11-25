@@ -23,6 +23,36 @@ StagMotionBandsAudioProcessor::StagMotionBandsAudioProcessor()
 
     for (auto& filter : highPassFilters)
         filter.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
+
+    for (auto& bandFilters : allPassFilters)
+        for (auto& filter : bandFilters)
+            filter.setType (juce::dsp::LinkwitzRileyFilterType::allpass);
+
+    bandCountParameter = parameters.getRawParameterValue ("bandCount");
+
+    for (int index = 0; index < maxCrossovers; ++index)
+        crossoverParameters[static_cast<size_t> (index)] = parameters.getRawParameterValue (crossoverParameterId (index));
+
+    for (int band = 0; band < maxBands; ++band)
+    {
+        auto& pointers = bandParameters[static_cast<size_t> (band)];
+        pointers.mute = parameters.getRawParameterValue (muteParameterId (band));
+        pointers.solo = parameters.getRawParameterValue (soloParameterId (band));
+        pointers.effectType = parameters.getRawParameterValue (effectTypeParameterId (band));
+        pointers.rate = parameters.getRawParameterValue (rateParameterId (band));
+        pointers.depth = parameters.getRawParameterValue (depthParameterId (band));
+        pointers.feedback = parameters.getRawParameterValue (feedbackParameterId (band));
+        pointers.mix = parameters.getRawParameterValue (mixParameterId (band));
+        pointers.sync = parameters.getRawParameterValue (syncParameterId (band));
+        pointers.division = parameters.getRawParameterValue (divisionParameterId (band));
+        pointers.waveform = parameters.getRawParameterValue (waveformParameterId (band));
+        pointers.stereoSpread = parameters.getRawParameterValue (stereoSpreadParameterId (band));
+        pointers.modulationSource = parameters.getRawParameterValue (modulationSourceParameterId (band));
+        pointers.attack = parameters.getRawParameterValue (attackParameterId (band));
+        pointers.release = parameters.getRawParameterValue (releaseParameterId (band));
+        pointers.retrigger = parameters.getRawParameterValue (retriggerParameterId (band));
+        pointers.carrierFrequency = parameters.getRawParameterValue (carrierFrequencyParameterId (band));
+    }
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout StagMotionBandsAudioProcessor::createParameterLayout()
@@ -188,31 +218,44 @@ juce::AudioProcessorValueTreeState::ParameterLayout StagMotionBandsAudioProcesso
     return { result.begin(), result.end() };
 }
 
-void StagMotionBandsAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+void StagMotionBandsAudioProcessor::prepareToPlay (double sampleRate, int)
 {
-    preparedBlockSize = juce::jmax (1, samplesPerBlock);
     preparedChannels = juce::jmax (1, getTotalNumOutputChannels());
 
     const juce::dsp::ProcessSpec spec {
         sampleRate,
-        static_cast<juce::uint32> (preparedBlockSize),
+        static_cast<juce::uint32> (sectionSize),
         static_cast<juce::uint32> (preparedChannels)
     };
 
-    for (int index = 0; index < maxCrossovers; ++index)
-    {
-        lowPassFilters[static_cast<size_t> (index)].prepare (spec);
-        highPassFilters[static_cast<size_t> (index)].prepare (spec);
-        lowPassFilters[static_cast<size_t> (index)].reset();
-        highPassFilters[static_cast<size_t> (index)].reset();
-    }
+    for (auto& filter : lowPassFilters)
+        filter.prepare (spec);
+
+    for (auto& filter : highPassFilters)
+        filter.prepare (spec);
+
+    for (auto& bandFilters : allPassFilters)
+        for (auto& filter : bandFilters)
+            filter.prepare (spec);
 
     for (auto& engine : modulationEngines)
         engine.prepare (spec);
 
-    remainingBuffer.setSize (preparedChannels, preparedBlockSize);
+    for (auto& smoother : crossoverSmoothers)
+        smoother.reset (sampleRate, 0.05);
+
+    for (auto& gain : bandGains)
+        gain.reset (sampleRate, 0.01);
+
+    layoutFadeStep = static_cast<float> (1.0 / (0.005 * sampleRate));
+
+    remainingBuffer.setSize (preparedChannels, sectionSize);
     for (auto& bandBuffer : bandBuffers)
-        bandBuffer.setSize (preparedChannels, preparedBlockSize);
+        bandBuffer.setSize (preparedChannels, sectionSize);
+
+    applyTargetLayout();
+    layoutFade = LayoutFade::none;
+    layoutGain = 1.0f;
 
     analyzerFifo.reset();
 }
@@ -245,130 +288,261 @@ void StagMotionBandsAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
 
     pushAnalyzerSamples (buffer);
 
-    const auto bandCount = getBandCount();
-    const auto numSamples = buffer.getNumSamples();
-    const auto numChannels = buffer.getNumChannels();
-
-    if (numSamples > preparedBlockSize || numChannels > preparedChannels)
-    {
-        jassertfalse;
+    if (preparedChannels == 0)
         return;
-    }
 
-    bool hasNoteOn = false;
-    for (const auto metadata : midiMessages)
-        hasNoteOn = hasNoteOn || metadata.getMessage().isNoteOn();
-
-    if (hasNoteOn)
-        for (int band = 0; band < bandCount; ++band)
-            if (parameters.getRawParameterValue (retriggerParameterId (band))->load() >= 0.5f)
-                modulationEngines[static_cast<size_t> (band)].trigger();
-
-    if (bandCount == 1)
-    {
-        bandBuffers[0].makeCopyOf (buffer, true);
-    }
-    else
-    {
-        const auto crossovers = getSortedCrossovers();
-        updateFilterCutoffs (crossovers, bandCount - 1);
-
-        remainingBuffer.makeCopyOf (buffer, true);
-
-        for (int split = 0; split < bandCount - 1; ++split)
-        {
-            auto& lowBand = bandBuffers[static_cast<size_t> (split)];
-            lowBand.makeCopyOf (remainingBuffer, true);
-
-            juce::dsp::AudioBlock<float> lowBlock (lowBand);
-            juce::dsp::AudioBlock<float> highBlock (remainingBuffer);
-            lowBlock = lowBlock.getSubBlock (0, static_cast<size_t> (numSamples));
-            highBlock = highBlock.getSubBlock (0, static_cast<size_t> (numSamples));
-
-            juce::dsp::ProcessContextReplacing<float> lowContext (lowBlock);
-            juce::dsp::ProcessContextReplacing<float> highContext (highBlock);
-            lowPassFilters[static_cast<size_t> (split)].process (lowContext);
-            highPassFilters[static_cast<size_t> (split)].process (highContext);
-        }
-
-        bandBuffers[static_cast<size_t> (bandCount - 1)].makeCopyOf (remainingBuffer, true);
-    }
+    jassert (buffer.getNumChannels() <= preparedChannels);
+    const auto numChannels = juce::jmin (buffer.getNumChannels(), preparedChannels);
+    const auto numSamples = buffer.getNumSamples();
 
     auto bpm = 120.0;
     if (auto* playHead = getPlayHead())
         if (const auto position = playHead->getPosition())
             bpm = position->getBpm().orFallback (120.0);
 
-    for (int band = 0; band < bandCount; ++band)
+    auto midiEvent = midiMessages.cbegin();
+    const auto midiEnd = midiMessages.cend();
+
+    for (int start = 0; start < numSamples; start += sectionSize)
+    {
+        const auto length = juce::jmin (sectionSize, numSamples - start);
+
+        bool noteOn = false;
+        for (; midiEvent != midiEnd && (*midiEvent).samplePosition < start + length; ++midiEvent)
+        {
+            const auto metadata = *midiEvent;
+            noteOn = noteOn
+                  || (metadata.numBytes >= 3 && (metadata.data[0] & 0xf0) == 0x90 && metadata.data[2] != 0);
+        }
+
+        juce::AudioBuffer<float> section (buffer.getArrayOfWritePointers(), numChannels, start, length);
+        processSection (section, noteOn, bpm);
+    }
+}
+
+void StagMotionBandsAudioProcessor::processSection (juce::AudioBuffer<float>& section, bool noteOn, double bpm)
+{
+    const auto numSamples = section.getNumSamples();
+    const auto numChannels = section.getNumChannels();
+
+    if (layoutFade != LayoutFade::fadingOut && targetLayoutDiffers())
+        layoutFade = LayoutFade::fadingOut;
+
+    // While fading out, the old crossovers stay put; the new ones are applied at silence.
+    if (layoutFade != LayoutFade::fadingOut)
+        updateCrossoverTargets();
+
+    const auto anySolo = anyBandSoloed();
+
+    for (int band = 0; band < appliedBandCount; ++band)
+    {
+        const auto& pointers = bandParameters[static_cast<size_t> (band)];
+        auto& gain = bandGains[static_cast<size_t> (band)];
+        auto& engine = modulationEngines[static_cast<size_t> (band)];
+        auto& appliedEffect = appliedEffects[static_cast<size_t> (band)];
+
+        // An effect change ramps this band to silence, swaps the effect with cleared
+        // state, then ramps back, so stale delay lines and phase jumps never click.
+        const auto targetEffect = readChoice (pointers.effectType);
+        if (targetEffect != appliedEffect && ! gain.isSmoothing() && gain.getCurrentValue() == 0.0f)
+        {
+            appliedEffect = targetEffect;
+            engine.reset();
+        }
+
+        gain.setTargetValue (bandIsAudible (band, anySolo) && targetEffect == appliedEffect ? 1.0f : 0.0f);
+
+        if (noteOn && pointers.retrigger->load() >= 0.5f)
+            engine.trigger();
+    }
+
+    splitIntoBands (section);
+
+    for (int band = 0; band < appliedBandCount; ++band)
         applyBandEffect (band, numSamples, bpm);
 
-    bool anySolo = false;
-    for (int band = 0; band < bandCount; ++band)
-        anySolo = anySolo || parameters.getRawParameterValue (soloParameterId (band))->load() >= 0.5f;
+    section.clear();
 
-    buffer.clear();
-
-    for (int band = 0; band < bandCount; ++band)
+    for (int band = 0; band < appliedBandCount; ++band)
     {
-        const auto muted = parameters.getRawParameterValue (muteParameterId (band))->load() >= 0.5f;
-        const auto soloed = parameters.getRawParameterValue (soloParameterId (band))->load() >= 0.5f;
-        const auto audible = ! muted && (! anySolo || soloed);
-
-        if (! audible)
+        auto& gain = bandGains[static_cast<size_t> (band)];
+        const auto startGain = gain.getCurrentValue();
+        const auto endGain = gain.skip (numSamples);
+        if (startGain == 0.0f && endGain == 0.0f)
             continue;
 
+        const auto& bandBuffer = bandBuffers[static_cast<size_t> (band)];
         for (int channel = 0; channel < numChannels; ++channel)
-            buffer.addFrom (channel, 0, bandBuffers[static_cast<size_t> (band)], channel, 0, numSamples);
+            section.addFromWithRamp (channel, 0, bandBuffer.getReadPointer (channel), numSamples, startGain, endGain);
     }
+
+    if (layoutFade == LayoutFade::none)
+        return;
+
+    const auto startGain = layoutGain;
+    const auto change = layoutFadeStep * static_cast<float> (numSamples);
+    layoutGain = layoutFade == LayoutFade::fadingOut ? juce::jmax (0.0f, layoutGain - change)
+                                                     : juce::jmin (1.0f, layoutGain + change);
+    section.applyGainRamp (0, numSamples, startGain, layoutGain);
+
+    if (layoutFade == LayoutFade::fadingOut && layoutGain <= 0.0f)
+    {
+        applyTargetLayout();
+        layoutFade = LayoutFade::fadingIn;
+    }
+    else if (layoutFade == LayoutFade::fadingIn && layoutGain >= 1.0f)
+    {
+        layoutFade = LayoutFade::none;
+    }
+}
+
+bool StagMotionBandsAudioProcessor::targetLayoutDiffers() const noexcept
+{
+    return getBandCount() != appliedBandCount;
+}
+
+void StagMotionBandsAudioProcessor::applyTargetLayout()
+{
+    appliedBandCount = getBandCount();
+    const auto crossovers = getSortedCrossovers();
+
+    for (int index = 0; index < maxCrossovers; ++index)
+    {
+        const auto frequency = crossovers[static_cast<size_t> (index)];
+        crossoverSmoothers[static_cast<size_t> (index)].setCurrentAndTargetValue (frequency);
+        appliedCutoffs[static_cast<size_t> (index)] = frequency;
+
+        auto& lowPass = lowPassFilters[static_cast<size_t> (index)];
+        auto& highPass = highPassFilters[static_cast<size_t> (index)];
+        lowPass.setCutoffFrequency (frequency);
+        highPass.setCutoffFrequency (frequency);
+        lowPass.reset();
+        highPass.reset();
+
+        for (auto& bandFilters : allPassFilters)
+        {
+            bandFilters[static_cast<size_t> (index)].setCutoffFrequency (frequency);
+            bandFilters[static_cast<size_t> (index)].reset();
+        }
+    }
+
+    const auto anySolo = anyBandSoloed();
+
+    for (int band = 0; band < maxBands; ++band)
+    {
+        appliedEffects[static_cast<size_t> (band)] = readChoice (bandParameters[static_cast<size_t> (band)].effectType);
+        modulationEngines[static_cast<size_t> (band)].reset();
+        bandGains[static_cast<size_t> (band)].setCurrentAndTargetValue (bandIsAudible (band, anySolo) ? 1.0f : 0.0f);
+    }
+}
+
+void StagMotionBandsAudioProcessor::updateCrossoverTargets()
+{
+    const auto crossovers = getSortedCrossovers();
+
+    for (int index = 0; index < appliedBandCount - 1; ++index)
+        crossoverSmoothers[static_cast<size_t> (index)].setTargetValue (crossovers[static_cast<size_t> (index)]);
+}
+
+void StagMotionBandsAudioProcessor::splitIntoBands (const juce::AudioBuffer<float>& section)
+{
+    const auto numSamples = section.getNumSamples();
+    const auto numSplits = appliedBandCount - 1;
+
+    if (numSplits == 0)
+    {
+        bandBuffers[0].makeCopyOf (section, true);
+        return;
+    }
+
+    for (int index = 0; index < numSplits; ++index)
+    {
+        const auto cutoff = crossoverSmoothers[static_cast<size_t> (index)].skip (numSamples);
+        auto& applied = appliedCutoffs[static_cast<size_t> (index)];
+        if (juce::exactlyEqual (cutoff, applied))
+            continue;
+
+        applied = cutoff;
+        lowPassFilters[static_cast<size_t> (index)].setCutoffFrequency (cutoff);
+        highPassFilters[static_cast<size_t> (index)].setCutoffFrequency (cutoff);
+        for (auto& bandFilters : allPassFilters)
+            bandFilters[static_cast<size_t> (index)].setCutoffFrequency (cutoff);
+    }
+
+    const auto process = [] (juce::dsp::LinkwitzRileyFilter<float>& filter, juce::AudioBuffer<float>& target)
+    {
+        juce::dsp::AudioBlock<float> block (target);
+        juce::dsp::ProcessContextReplacing<float> context (block);
+        filter.process (context);
+    };
+
+    remainingBuffer.makeCopyOf (section, true);
+
+    for (int split = 0; split < numSplits; ++split)
+    {
+        auto& lowBand = bandBuffers[static_cast<size_t> (split)];
+        lowBand.makeCopyOf (remainingBuffer, true);
+        process (lowPassFilters[static_cast<size_t> (split)], lowBand);
+        process (highPassFilters[static_cast<size_t> (split)], remainingBuffer);
+    }
+
+    bandBuffers[static_cast<size_t> (numSplits)].makeCopyOf (remainingBuffer, true);
+
+    // Each band below a split must pass through that split's allpass, or the bands
+    // only sum flat when the crossovers are far apart.
+    for (int band = 0; band < numSplits - 1; ++band)
+        for (int crossover = band + 1; crossover < numSplits; ++crossover)
+            process (allPassFilters[static_cast<size_t> (band)][static_cast<size_t> (crossover)],
+                     bandBuffers[static_cast<size_t> (band)]);
 }
 
 void StagMotionBandsAudioProcessor::applyBandEffect (int bandIndex, int numSamples, double bpm)
 {
-    const auto effectType = static_cast<int> (std::lround (
-        parameters.getRawParameterValue (effectTypeParameterId (bandIndex))->load()));
-
-    const auto tempoSync = parameters.getRawParameterValue (syncParameterId (bandIndex))->load() >= 0.5f;
-    const auto division = static_cast<int> (std::lround (
-        parameters.getRawParameterValue (divisionParameterId (bandIndex))->load()));
+    const auto& pointers = bandParameters[static_cast<size_t> (bandIndex)];
+    const auto effectType = appliedEffects[static_cast<size_t> (bandIndex)];
+    const auto tempoSync = pointers.sync->load() >= 0.5f;
+    const auto division = readChoice (pointers.division);
 
     BandModulationEngine::Settings settings;
     settings.effectType = effectType;
-    settings.waveform = static_cast<int> (std::lround (
-        parameters.getRawParameterValue (waveformParameterId (bandIndex))->load()));
-    settings.modulationSource = static_cast<int> (std::lround (
-        parameters.getRawParameterValue (modulationSourceParameterId (bandIndex))->load()));
-    settings.rateHz = tempoSync
-                          ? BandModulationEngine::rateForDivision (bpm, division)
-                          : parameters.getRawParameterValue (rateParameterId (bandIndex))->load();
-    settings.depth = parameters.getRawParameterValue (depthParameterId (bandIndex))->load();
-    settings.feedback = parameters.getRawParameterValue (feedbackParameterId (bandIndex))->load();
-    settings.mix = parameters.getRawParameterValue (mixParameterId (bandIndex))->load();
-    settings.stereoSpread = parameters.getRawParameterValue (stereoSpreadParameterId (bandIndex))->load();
-    settings.attackMs = parameters.getRawParameterValue (attackParameterId (bandIndex))->load();
-    settings.releaseMs = parameters.getRawParameterValue (releaseParameterId (bandIndex))->load();
+    settings.waveform = readChoice (pointers.waveform);
+    settings.modulationSource = readChoice (pointers.modulationSource);
+    settings.rateHz = tempoSync ? BandModulationEngine::rateForDivision (bpm, division)
+                                : pointers.rate->load();
+    settings.depth = pointers.depth->load();
+    settings.feedback = pointers.feedback->load();
+    settings.mix = pointers.mix->load();
+    settings.stereoSpread = pointers.stereoSpread->load();
+    settings.attackMs = pointers.attack->load();
+    settings.releaseMs = pointers.release->load();
     const auto usesCarrier = effectType == BandModulationEngine::ringMod
                           || effectType == BandModulationEngine::frequencyShifter;
-    settings.carrierHz = tempoSync && usesCarrier
-                             ? BandModulationEngine::rateForDivision (bpm, division)
-                             : parameters.getRawParameterValue (
-                                   carrierFrequencyParameterId (bandIndex))->load();
+    settings.carrierHz = tempoSync && usesCarrier ? BandModulationEngine::rateForDivision (bpm, division)
+                                                  : pointers.carrierFrequency->load();
 
     auto& engine = modulationEngines[static_cast<size_t> (bandIndex)];
     engine.process (bandBuffers[static_cast<size_t> (bandIndex)], numSamples, settings);
-    modulationActivity[static_cast<size_t> (bandIndex)].store (
-        engine.getActivity(), std::memory_order_relaxed);
+    modulationActivity[static_cast<size_t> (bandIndex)].store (engine.getActivity(), std::memory_order_relaxed);
 }
 
-void StagMotionBandsAudioProcessor::updateFilterCutoffs (
-    const std::array<float, maxCrossovers>& frequencies,
-    int numCrossovers)
+bool StagMotionBandsAudioProcessor::anyBandSoloed() const noexcept
 {
-    for (int index = 0; index < numCrossovers; ++index)
-    {
-        const auto frequency = frequencies[static_cast<size_t> (index)];
-        lowPassFilters[static_cast<size_t> (index)].setCutoffFrequency (frequency);
-        highPassFilters[static_cast<size_t> (index)].setCutoffFrequency (frequency);
-    }
+    for (int band = 0; band < appliedBandCount; ++band)
+        if (bandParameters[static_cast<size_t> (band)].solo->load() >= 0.5f)
+            return true;
+
+    return false;
+}
+
+bool StagMotionBandsAudioProcessor::bandIsAudible (int bandIndex, bool anySolo) const noexcept
+{
+    const auto& pointers = bandParameters[static_cast<size_t> (bandIndex)];
+    return pointers.mute->load() < 0.5f && (! anySolo || pointers.solo->load() >= 0.5f);
+}
+
+int StagMotionBandsAudioProcessor::readChoice (const std::atomic<float>* value) const noexcept
+{
+    return static_cast<int> (std::lround (value->load()));
 }
 
 void StagMotionBandsAudioProcessor::pushAnalyzerSamples (const juce::AudioBuffer<float>& buffer)
@@ -437,8 +611,7 @@ float StagMotionBandsAudioProcessor::getModulationActivity (int bandIndex) const
 
 int StagMotionBandsAudioProcessor::getBandCount() const noexcept
 {
-    return juce::jlimit (1, maxBands,
-                         static_cast<int> (std::lround (parameters.getRawParameterValue ("bandCount")->load())));
+    return juce::jlimit (1, maxBands, static_cast<int> (std::lround (bandCountParameter->load())));
 }
 
 std::array<float, StagMotionBandsAudioProcessor::maxCrossovers>
@@ -447,8 +620,7 @@ StagMotionBandsAudioProcessor::getSortedCrossovers() const
     std::array<float, maxCrossovers> frequencies {};
 
     for (int index = 0; index < maxCrossovers; ++index)
-        frequencies[static_cast<size_t> (index)] =
-            clampFrequency (parameters.getRawParameterValue (crossoverParameterId (index))->load());
+        frequencies[static_cast<size_t> (index)] = clampFrequency (crossoverParameters[static_cast<size_t> (index)]->load());
 
     std::sort (frequencies.begin(), frequencies.begin() + juce::jmax (0, getBandCount() - 1));
     return frequencies;
@@ -460,49 +632,52 @@ void StagMotionBandsAudioProcessor::addCrossover (float frequencyHz)
     if (oldBandCount >= maxBands)
         return;
 
-    std::vector<float> active;
+    const auto frequency = clampFrequency (frequencyHz);
     const auto sorted = getSortedCrossovers();
-    active.assign (sorted.begin(), sorted.begin() + oldBandCount - 1);
-    active.push_back (clampFrequency (frequencyHz));
-    std::sort (active.begin(), active.end());
+    const auto activeEnd = sorted.begin() + (oldBandCount - 1);
+    const auto splitBand = static_cast<int> (std::lower_bound (sorted.begin(), activeEnd, frequency) - sorted.begin());
 
+    // Bands above the split move up one slot; the new upper half copies the split band.
+    for (int band = oldBandCount; band > splitBand; --band)
+        copyBandSettings (band - 1, band);
+
+    std::vector<float> active (sorted.begin(), activeEnd);
+    active.insert (active.begin() + splitBand, frequency);
     for (int index = 0; index < static_cast<int> (active.size()); ++index)
-        setCrossover (index, active[static_cast<size_t> (index)]);
+        setCrossoverWithGesture (index, active[static_cast<size_t> (index)]);
 
-    if (auto* parameter = parameters.getParameter ("bandCount"))
-    {
-        parameter->beginChangeGesture();
-        parameter->setValueNotifyingHost (parameter->convertTo0to1 (static_cast<float> (oldBandCount + 1)));
-        parameter->endChangeGesture();
-    }
+    setBandCountWithGesture (oldBandCount + 1);
 }
 
 void StagMotionBandsAudioProcessor::removeCrossover (int crossoverIndex)
 {
-    const auto oldBandCount = getBandCount();
-    if (oldBandCount <= 1 || crossoverIndex < 0 || crossoverIndex >= oldBandCount - 1)
-        return;
-
-    auto active = getSortedCrossovers();
-    for (int index = crossoverIndex; index < oldBandCount - 2; ++index)
-        setCrossover (index, active[static_cast<size_t> (index + 1)]);
-
-    if (auto* parameter = parameters.getParameter ("bandCount"))
-    {
-        parameter->beginChangeGesture();
-        parameter->setValueNotifyingHost (parameter->convertTo0to1 (static_cast<float> (oldBandCount - 1)));
-        parameter->endChangeGesture();
-    }
+    removeBandAndCrossover (crossoverIndex + 1, crossoverIndex);
 }
 
 void StagMotionBandsAudioProcessor::removeBand (int bandIndex)
 {
-    const auto bandCount = getBandCount();
-    if (bandCount <= 1 || bandIndex < 0 || bandIndex >= bandCount)
+    removeBandAndCrossover (bandIndex, bandIndex == 0 ? 0 : bandIndex - 1);
+}
+
+void StagMotionBandsAudioProcessor::removeBandAndCrossover (int droppedBand, int droppedCrossover)
+{
+    const auto oldBandCount = getBandCount();
+    if (oldBandCount <= 1
+        || droppedBand < 0 || droppedBand >= oldBandCount
+        || droppedCrossover < 0 || droppedCrossover >= oldBandCount - 1)
         return;
 
-    // The first band merges right; every other band merges into its left neighbour.
-    removeCrossover (bandIndex == 0 ? 0 : bandIndex - 1);
+    const auto sorted = getSortedCrossovers();
+
+    for (int band = droppedBand; band < oldBandCount - 1; ++band)
+        copyBandSettings (band + 1, band);
+
+    // Rewrite every remaining crossover in sorted order: the stored parameters may be
+    // unsorted (host automation), and slots are matched to bands by sorted position.
+    for (int index = 0; index < oldBandCount - 2; ++index)
+        setCrossoverWithGesture (index, sorted[static_cast<size_t> (index < droppedCrossover ? index : index + 1)]);
+
+    setBandCountWithGesture (oldBandCount - 1);
 }
 
 void StagMotionBandsAudioProcessor::setCrossover (int crossoverIndex, float frequencyHz)
@@ -512,6 +687,62 @@ void StagMotionBandsAudioProcessor::setCrossover (int crossoverIndex, float freq
 
     if (auto* parameter = parameters.getParameter (crossoverParameterId (crossoverIndex)))
         parameter->setValueNotifyingHost (parameter->convertTo0to1 (clampFrequency (frequencyHz)));
+}
+
+void StagMotionBandsAudioProcessor::setParameterWithGesture (const juce::String& parameterId, float normalisedValue)
+{
+    auto* parameter = parameters.getParameter (parameterId);
+    if (parameter == nullptr || juce::exactlyEqual (parameter->getValue(), normalisedValue))
+        return;
+
+    parameter->beginChangeGesture();
+    parameter->setValueNotifyingHost (normalisedValue);
+    parameter->endChangeGesture();
+}
+
+void StagMotionBandsAudioProcessor::setCrossoverWithGesture (int crossoverIndex, float frequencyHz)
+{
+    const auto parameterId = crossoverParameterId (crossoverIndex);
+    if (auto* parameter = parameters.getParameter (parameterId))
+        setParameterWithGesture (parameterId, parameter->convertTo0to1 (clampFrequency (frequencyHz)));
+}
+
+void StagMotionBandsAudioProcessor::setBandCountWithGesture (int bandCount)
+{
+    if (auto* parameter = parameters.getParameter ("bandCount"))
+        setParameterWithGesture ("bandCount", parameter->convertTo0to1 (static_cast<float> (bandCount)));
+}
+
+void StagMotionBandsAudioProcessor::copyBandSettings (int sourceBand, int destinationBand)
+{
+    const auto sourceIds = bandParameterIds (sourceBand);
+    const auto destinationIds = bandParameterIds (destinationBand);
+
+    for (int index = 0; index < sourceIds.size(); ++index)
+        if (auto* source = parameters.getParameter (sourceIds[index]))
+            setParameterWithGesture (destinationIds[index], source->getValue());
+}
+
+juce::StringArray StagMotionBandsAudioProcessor::bandParameterIds (int bandIndex)
+{
+    return {
+        muteParameterId (bandIndex),
+        soloParameterId (bandIndex),
+        effectTypeParameterId (bandIndex),
+        rateParameterId (bandIndex),
+        depthParameterId (bandIndex),
+        feedbackParameterId (bandIndex),
+        mixParameterId (bandIndex),
+        syncParameterId (bandIndex),
+        divisionParameterId (bandIndex),
+        waveformParameterId (bandIndex),
+        stereoSpreadParameterId (bandIndex),
+        modulationSourceParameterId (bandIndex),
+        attackParameterId (bandIndex),
+        releaseParameterId (bandIndex),
+        retriggerParameterId (bandIndex),
+        carrierFrequencyParameterId (bandIndex)
+    };
 }
 
 juce::String StagMotionBandsAudioProcessor::crossoverParameterId (int index)
