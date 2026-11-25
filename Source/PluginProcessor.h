@@ -113,12 +113,19 @@ private:
     void removeBandAndCrossover (int droppedBand, int droppedCrossover);
 
     void pushAnalyzerSamples (const juce::AudioBuffer<float>& buffer);
-    void processSection (juce::AudioBuffer<float>& section, bool noteOn, double bpm);
+    // Host tempo, plus the beat position at the start of a section while the transport plays.
+    struct SectionTransport
+    {
+        double bpm = 120.0;
+        std::optional<double> ppq;
+    };
+
+    void processSection (juce::AudioBuffer<float>& section, bool noteOn, const SectionTransport& transport);
     bool targetLayoutDiffers() const noexcept;
     void applyTargetLayout();
     void updateCrossoverTargets();
     void splitIntoBands (const juce::AudioBuffer<float>& section);
-    void applyBandEffect (int bandIndex, int numSamples, double bpm);
+    void applyBandEffect (int bandIndex, int numSamples, const SectionTransport& transport);
     bool anyBandSoloed() const noexcept;
     bool bandIsAudible (int bandIndex, bool anySolo) const noexcept;
     int readChoice (const std::atomic<float>* value) const noexcept;
@@ -142,6 +149,7 @@ private:
     std::array<juce::AudioBuffer<float>, maxBands> bandBuffers;
     juce::AudioBuffer<float> remainingBuffer;
     int preparedChannels = 0;
+    double preparedSampleRate = 44100.0;
 
     // Layout = band count and per-band effect type. Changing either fades the output
     // out on the old layout, switches with cleared filter/effect state, then fades in.

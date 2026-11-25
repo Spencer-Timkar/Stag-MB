@@ -420,6 +420,176 @@ bool runEditsDoNotClickTest()
 
     return true;
 }
+
+double goertzelPower (const std::vector<float>& samples, double frequency, double sampleRate)
+{
+    const auto coefficient = 2.0 * std::cos (juce::MathConstants<double>::twoPi * frequency / sampleRate);
+    double previous = 0.0;
+    double beforePrevious = 0.0;
+
+    for (const auto sample : samples)
+    {
+        const auto current = static_cast<double> (sample) + coefficient * previous - beforePrevious;
+        beforePrevious = previous;
+        previous = current;
+    }
+
+    return previous * previous + beforePrevious * beforePrevious - coefficient * previous * beforePrevious;
+}
+
+// A single-sideband shifter must move a tone up by the carrier and suppress the mirror
+// image, in low bands as well as high ones.
+bool runFrequencyShifterRejectsImageTest()
+{
+    using Processor = StagMotionBandsAudioProcessor;
+    constexpr double sampleRate = 48000.0;
+    const std::array<std::pair<double, float>, 3> cases { { { 100.0, 40.0f }, { 1000.0, 200.0f }, { 5000.0, 300.0f } } };
+
+    for (const auto& [frequency, carrier] : cases)
+    {
+        Processor processor;
+        setParameter (processor, Processor::effectTypeParameterId (0), BandModulationEngine::frequencyShifter);
+        setParameter (processor, Processor::mixParameterId (0), 1.0f);
+        setParameter (processor, Processor::stereoSpreadParameterId (0), 0.0f);
+        setParameter (processor, Processor::carrierFrequencyParameterId (0), carrier);
+        processor.setRateAndBufferSizeDetails (sampleRate, 480);
+        processor.prepareToPlay (sampleRate, 480);
+
+        juce::AudioBuffer<float> buffer (2, 480);
+        juce::MidiBuffer midi;
+        std::vector<float> output;
+        long position = 0;
+
+        for (int block = 0; block < 150; ++block)
+        {
+            for (int sample = 0; sample < buffer.getNumSamples(); ++sample, ++position)
+            {
+                const auto value = static_cast<float> (
+                    0.5 * std::sin (juce::MathConstants<double>::twoPi * frequency * static_cast<double> (position) / sampleRate));
+                buffer.setSample (0, sample, value);
+                buffer.setSample (1, sample, value);
+            }
+
+            processor.processBlock (buffer, midi);
+
+            if (block >= 50)
+                for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+                    output.push_back (buffer.getSample (0, sample));
+        }
+
+        const auto upper = goertzelPower (output, frequency + carrier, sampleRate);
+        const auto image = goertzelPower (output, std::abs (frequency - carrier), sampleRate);
+        const auto rejectionDb = 10.0 * std::log10 (upper / image);
+        if (rejectionDb < 30.0)
+        {
+            std::cerr << "  " << frequency << " Hz shifted by " << carrier << " Hz: image only "
+                      << rejectionDb << " dB below the shifted tone\n";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+class TestPlayHead final : public juce::AudioPlayHead
+{
+public:
+    juce::Optional<PositionInfo> getPosition() const override { return info; }
+    PositionInfo info;
+};
+
+// A synced LFO must sit at the host's bar position, not wherever it happened to start.
+bool runSyncedLfoFollowsHostTest()
+{
+    using Processor = StagMotionBandsAudioProcessor;
+    constexpr double sampleRate = 48000.0;
+    constexpr double bpm = 120.0;
+    constexpr int blockSize = 480;
+    constexpr double startPpq = 0.37;
+
+    Processor processor;
+    setParameter (processor, Processor::effectTypeParameterId (0), BandModulationEngine::tremolo);
+    setParameter (processor, Processor::syncParameterId (0), 1.0f);
+    setParameter (processor, Processor::divisionParameterId (0), 3.0f); // 1/4: one cycle per beat
+    setParameter (processor, Processor::depthParameterId (0), 1.0f);
+    setParameter (processor, Processor::mixParameterId (0), 1.0f);
+    setParameter (processor, Processor::stereoSpreadParameterId (0), 0.0f);
+
+    TestPlayHead playHead;
+    playHead.info.setBpm (bpm);
+    playHead.info.setIsPlaying (true);
+    processor.setPlayHead (&playHead);
+    processor.setRateAndBufferSizeDetails (sampleRate, blockSize);
+    processor.prepareToPlay (sampleRate, blockSize);
+
+    juce::AudioBuffer<float> buffer (2, blockSize);
+    juce::MidiBuffer midi;
+    const auto beatsPerSample = bpm / 60.0 / sampleRate;
+    float largestError = 0.0f;
+
+    for (int block = 0; block < 100; ++block)
+    {
+        const auto blockPpq = startPpq + beatsPerSample * blockSize * block;
+        playHead.info.setPpqPosition (blockPpq);
+        for (int channel = 0; channel < 2; ++channel)
+            for (int sample = 0; sample < blockSize; ++sample)
+                buffer.setSample (channel, sample, 1.0f);
+
+        processor.processBlock (buffer, midi);
+
+        if (block < 90)
+            continue;
+
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const auto beats = blockPpq + beatsPerSample * sample;
+            const auto lfo = std::sin (juce::MathConstants<double>::twoPi * (beats - std::floor (beats)));
+            const auto expected = static_cast<float> (1.0 - (lfo * 0.5 + 0.5));
+            largestError = juce::jmax (largestError, std::abs (buffer.getSample (0, sample) - expected));
+        }
+    }
+
+    processor.setPlayHead (nullptr);
+
+    if (largestError > 0.01f)
+    {
+        std::cerr << "  synced tremolo is off the host position by up to " << largestError << '\n';
+        return false;
+    }
+
+    return true;
+}
+
+// The envelope follower works in dB, so a band peaking around -30 dBFS still moves it.
+bool runQuietEnvelopeStillModulatesTest()
+{
+    using Processor = StagMotionBandsAudioProcessor;
+
+    Processor processor;
+    setParameter (processor, Processor::modulationSourceParameterId (0), 1.0f);
+    setParameter (processor, Processor::attackParameterId (0), 1.0f);
+    processor.prepareToPlay (48000.0, 512);
+
+    juce::AudioBuffer<float> buffer (2, 512);
+    juce::MidiBuffer midi;
+    for (int block = 0; block < 40; ++block)
+    {
+        for (int channel = 0; channel < 2; ++channel)
+            for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+                buffer.setSample (channel, sample, 0.03f);
+
+        processor.processBlock (buffer, midi);
+    }
+
+    const auto activity = processor.getModulationActivity (0);
+    if (activity < 0.3f)
+    {
+        std::cerr << "  -30 dBFS band only reaches activity " << activity << '\n';
+        return false;
+    }
+
+    return true;
+}
 }
 
 int main()
@@ -475,6 +645,9 @@ int main()
         { "Crossover sum is flat", runCrossoverSumIsFlatTest },
         { "Oversized block is processed", runOversizedBlockIsProcessedTest },
         { "Edits do not click", runEditsDoNotClickTest },
+        { "Frequency shifter rejects the image", runFrequencyShifterRejectsImageTest },
+        { "Synced LFO follows the host", runSyncedLfoFollowsHostTest },
+        { "Quiet envelope still modulates", runQuietEnvelopeStillModulatesTest },
     };
 
     for (const auto& [name, test] : regressionTests)

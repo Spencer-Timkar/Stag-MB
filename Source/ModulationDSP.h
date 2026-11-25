@@ -57,8 +57,8 @@ public:
                              std::vector<float> (static_cast<size_t> (delayBufferSize), 0.0f));
         phaserStates.assign (static_cast<size_t> (channelCount), {});
         phaserFeedback.assign (static_cast<size_t> (channelCount), 0.0f);
-        hilbertBuffers.assign (static_cast<size_t> (channelCount), {});
-        initialiseHilbertCoefficients();
+        stageCoefficients.assign (static_cast<size_t> (channelCount), {});
+        hilbertFilters.assign (static_cast<size_t> (channelCount), {});
 
         for (auto* value : { &rate, &depth, &feedback, &mix, &spread, &carrierRate })
             value->reset (sampleRate, 0.025);
@@ -81,20 +81,30 @@ public:
             channel.fill (0.0f);
 
         std::fill (phaserFeedback.begin(), phaserFeedback.end(), 0.0f);
-        for (auto& channel : hilbertBuffers)
-            channel.fill (0.0f);
+        for (auto& filter : hilbertFilters)
+            filter.reset();
+
         writePosition = 0;
-        hilbertPosition = 0;
         phase = 0.0;
         carrierPhase = 0.0;
         envelopeValue = 0.0f;
         activity = 0.0f;
+        coefficientCountdown = 0;
+        coefficientEffect = -1;
     }
 
     void trigger() noexcept
     {
         phase = 0.0;
         carrierPhase = 0.0;
+    }
+
+    // Puts the LFO and carrier at a position measured in cycles, e.g. host beats divided
+    // by the beats per cycle of the synced division, so they stay locked to the bar.
+    void setCyclePosition (double cycles) noexcept
+    {
+        phase = cycles - std::floor (cycles);
+        carrierPhase = phase;
     }
 
     float getActivity() const noexcept { return activity; }
@@ -115,6 +125,13 @@ public:
         const auto channelsToProcess = juce::jmin (channelCount, buffer.getNumChannels());
         const auto attackCoefficient = timeCoefficient (settings.attackMs);
         const auto releaseCoefficient = timeCoefficient (settings.releaseMs);
+        const auto usesEnvelope = settings.modulationSource == envelope;
+
+        if (settings.effectType != coefficientEffect)
+        {
+            coefficientEffect = settings.effectType;
+            coefficientCountdown = 0;
+        }
 
         for (int sample = 0; sample < numSamples; ++sample)
         {
@@ -125,6 +142,11 @@ public:
             const auto currentSpread = spread.getNextValue();
             const auto currentCarrierRate = carrierRate.getNextValue();
 
+            // Allpass coefficients need tan/pow; the modulation is slow enough to
+            // refresh them every few samples instead of every sample.
+            const auto refreshCoefficients = coefficientCountdown == 0;
+            coefficientCountdown = refreshCoefficients ? coefficientInterval - 1 : coefficientCountdown - 1;
+
             float detectorInput = 0.0f;
             for (int channel = 0; channel < channelsToProcess; ++channel)
                 detectorInput = juce::jmax (detectorInput, std::abs (buffer.getSample (channel, sample)));
@@ -133,26 +155,25 @@ public:
                                                  ? attackCoefficient
                                                  : releaseCoefficient;
             envelopeValue = detectorInput + envelopeCoefficient * (envelopeValue - detectorInput);
-            const auto envelopeModulation = juce::jlimit (-1.0f, 1.0f, envelopeValue * 2.0f - 1.0f);
+            const auto envelopeModulation = usesEnvelope ? envelopeToModulation (envelopeValue) : 0.0f;
 
             for (int channel = 0; channel < channelsToProcess; ++channel)
             {
+                if (settings.effectType == off)
+                    break;
+
                 const auto channelPosition = channelsToProcess <= 1
                                                  ? 0.0f
                                                  : static_cast<float> (channel)
                                                        / static_cast<float> (channelsToProcess - 1);
                 const auto channelPhase = wrapPhase (static_cast<float> (phase)
                                                      + channelPosition * currentSpread * 0.5f);
-                const auto lfoValue = waveformValue (channelPhase, settings.waveform);
-                const auto modulation = settings.modulationSource == envelope
-                                            ? envelopeModulation
-                                            : lfoValue;
+                const auto modulation = usesEnvelope ? envelopeModulation
+                                                     : waveformValue (channelPhase, settings.waveform);
                 const auto input = buffer.getSample (channel, sample);
                 const auto carrierChannelPhase = wrapPhase (
                     static_cast<float> (carrierPhase) + channelPosition * currentSpread * 0.5f);
-
-                if (settings.effectType == off)
-                    continue;
+                auto& coefficients = stageCoefficients[static_cast<size_t> (channel)];
 
                 float wet = input;
                 if (settings.effectType == chorus || settings.effectType == flanger)
@@ -167,20 +188,18 @@ public:
                 }
                 else if (settings.effectType == phaser)
                 {
-                    auto driven = input + phaserFeedback[static_cast<size_t> (channel)] * currentFeedback;
-                    const auto centreFrequency = juce::jlimit (
-                        40.0f,
-                        static_cast<float> (sampleRate * 0.45),
-                        900.0f * std::pow (5.0f, modulation * currentDepth));
-                    const auto tangent = std::tan (juce::MathConstants<float>::pi * centreFrequency
-                                                   / static_cast<float> (sampleRate));
-                    const auto coefficient = (1.0f - tangent) / (1.0f + tangent);
+                    if (refreshCoefficients)
+                        coefficients[0] = allpassCoefficient (juce::jlimit (
+                            40.0f,
+                            static_cast<float> (sampleRate * 0.45),
+                            900.0f * std::pow (5.0f, modulation * currentDepth)));
 
+                    auto driven = input + phaserFeedback[static_cast<size_t> (channel)] * currentFeedback;
                     auto& stages = phaserStates[static_cast<size_t> (channel)];
                     for (auto& state : stages)
                     {
-                        const auto output = coefficient * driven + state;
-                        state = driven - coefficient * output;
+                        const auto output = coefficients[0] * driven + state;
+                        state = driven - coefficients[0] * output;
                         driven = output;
                     }
 
@@ -214,23 +233,29 @@ public:
                 }
                 else if (settings.effectType == phaseWarp)
                 {
-                    const auto magnitude = std::pow (std::abs (modulation),
-                                                     0.35f + (1.0f - currentDepth) * 0.65f);
-                    const auto warped = std::copysign (magnitude, modulation);
+                    if (refreshCoefficients)
+                    {
+                        const auto magnitude = std::pow (std::abs (modulation),
+                                                         0.35f + (1.0f - currentDepth) * 0.65f);
+                        const auto warped = std::copysign (magnitude, modulation);
+
+                        for (int stageIndex = 0; stageIndex < phaserStageCount; ++stageIndex)
+                        {
+                            const auto baseFrequency = 90.0f * std::pow (2.05f, static_cast<float> (stageIndex));
+                            const auto stageSkew = 1.0f + static_cast<float> (stageIndex) * 0.12f;
+                            coefficients[static_cast<size_t> (stageIndex)] = allpassCoefficient (juce::jlimit (
+                                35.0f,
+                                static_cast<float> (sampleRate * 0.45),
+                                baseFrequency * std::pow (7.0f, warped * currentDepth * stageSkew)));
+                        }
+                    }
+
                     auto driven = input;
                     auto& stages = phaserStates[static_cast<size_t> (channel)];
 
                     for (int stageIndex = 0; stageIndex < phaserStageCount; ++stageIndex)
                     {
-                        const auto baseFrequency = 90.0f * std::pow (2.05f, static_cast<float> (stageIndex));
-                        const auto stageSkew = 1.0f + static_cast<float> (stageIndex) * 0.12f;
-                        const auto frequency = juce::jlimit (
-                            35.0f,
-                            static_cast<float> (sampleRate * 0.45),
-                            baseFrequency * std::pow (7.0f, warped * currentDepth * stageSkew));
-                        const auto tangent = std::tan (juce::MathConstants<float>::pi * frequency
-                                                       / static_cast<float> (sampleRate));
-                        const auto coefficient = (1.0f - tangent) / (1.0f + tangent);
+                        const auto coefficient = coefficients[static_cast<size_t> (stageIndex)];
                         auto& state = stages[static_cast<size_t> (stageIndex)];
                         const auto output = coefficient * driven + state;
                         state = driven - coefficient * output;
@@ -241,21 +266,7 @@ public:
                 }
                 else if (settings.effectType == frequencyShifter)
                 {
-                    auto& history = hilbertBuffers[static_cast<size_t> (channel)];
-                    history[static_cast<size_t> (hilbertPosition)] = input;
-
-                    const auto delayedIndex = (hilbertPosition - hilbertCentre + hilbertTapCount)
-                                            % hilbertTapCount;
-                    const auto inPhase = history[static_cast<size_t> (delayedIndex)];
-                    float quadrature = 0.0f;
-                    for (int tap = 0; tap < hilbertTapCount; ++tap)
-                    {
-                        const auto historyIndex = (hilbertPosition - tap + hilbertTapCount)
-                                                % hilbertTapCount;
-                        quadrature += hilbertCoefficients[static_cast<size_t> (tap)]
-                                    * history[static_cast<size_t> (historyIndex)];
-                    }
-
+                    const auto [inPhase, quadrature] = hilbertFilters[static_cast<size_t> (channel)].process (input);
                     const auto angle = juce::MathConstants<float>::twoPi * carrierChannelPhase;
                     wet = inPhase * std::cos (angle) - quadrature * std::sin (angle);
                 }
@@ -265,49 +276,118 @@ public:
             }
 
             writePosition = (writePosition + 1) % delayBufferSize;
-            if (settings.effectType == frequencyShifter)
-                hilbertPosition = (hilbertPosition + 1) % hilbertTapCount;
             phase = wrapPhase (static_cast<float> (phase + currentRate / sampleRate));
             carrierPhase = wrapPhase (
                 static_cast<float> (carrierPhase + currentCarrierRate / sampleRate));
-            const auto usesCarrier = settings.effectType == ringMod
-                                  || settings.effectType == frequencyShifter;
-            activity = usesCarrier
-                           ? waveformValue (static_cast<float> (carrierPhase), sine) * 0.5f + 0.5f
-                           : settings.modulationSource == envelope
-                           ? juce::jlimit (0.0f, 1.0f, envelopeValue)
-                           : juce::jlimit (0.0f, 1.0f,
-                                          waveformValue (static_cast<float> (phase), settings.waveform)
-                                              * 0.5f + 0.5f);
         }
+
+        const auto usesCarrier = settings.effectType == ringMod
+                              || settings.effectType == frequencyShifter;
+        const auto bipolarActivity = usesCarrier  ? waveformValue (static_cast<float> (carrierPhase), sine)
+                                   : usesEnvelope ? envelopeToModulation (envelopeValue)
+                                                  : waveformValue (static_cast<float> (phase), settings.waveform);
+        activity = juce::jlimit (0.0f, 1.0f, bipolarActivity * 0.5f + 0.5f);
     }
 
-    static float rateForDivision (double bpm, int divisionIndex)
+    static float beatsPerCycleForDivision (int divisionIndex)
     {
         static constexpr std::array<float, 7> beatsPerCycle {
             0.125f, 0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f
         };
 
         const auto index = juce::jlimit (0, static_cast<int> (beatsPerCycle.size()) - 1, divisionIndex);
+        return beatsPerCycle[static_cast<size_t> (index)];
+    }
+
+    static float rateForDivision (double bpm, int divisionIndex)
+    {
         const auto beatsPerSecond = static_cast<float> (juce::jlimit (20.0, 400.0, bpm) / 60.0);
-        return beatsPerSecond / beatsPerCycle[static_cast<size_t> (index)];
+        return beatsPerSecond / beatsPerCycleForDivision (divisionIndex);
+    }
+
+    // Maps the follower level in dB onto the bipolar modulation range: -48 dBFS and below
+    // is -1, -24 dBFS is 0 and 0 dBFS is +1, so quiet bands still swing the modulation.
+    static float envelopeToModulation (float level)
+    {
+        constexpr auto floorDb = -48.0f;
+        return juce::jlimit (-1.0f, 1.0f, 1.0f + juce::Decibels::gainToDecibels (level, floorDb) * (2.0f / -floorDb));
     }
 
 private:
-    void initialiseHilbertCoefficients()
+    // Olli Niemitalo's pair of allpass chains whose outputs stay 90 degrees apart across
+    // nearly the whole audio band, unlike a short FIR Hilbert filter, which loses the
+    // quadrature at low frequencies and lets the unwanted sideband through.
+    class HilbertPair
     {
-        for (int tap = 0; tap < hilbertTapCount; ++tap)
+    public:
+        void reset() noexcept
         {
-            const auto offset = tap - hilbertCentre;
-            auto coefficient = 0.0f;
-            if (offset != 0 && std::abs (offset) % 2 == 1)
-                coefficient = 2.0f / (juce::MathConstants<float>::pi * static_cast<float> (offset));
+            for (auto* path : { &inPhasePath, &quadraturePath })
+                for (auto& section : *path)
+                    section = {};
 
-            const auto window = 0.5f - 0.5f * std::cos (
-                juce::MathConstants<float>::twoPi * static_cast<float> (tap)
-                / static_cast<float> (hilbertTapCount - 1));
-            hilbertCoefficients[static_cast<size_t> (tap)] = coefficient * window;
+            delayedInPhase = 0.0f;
         }
+
+        std::pair<float, float> process (float input) noexcept
+        {
+            auto inPhase = input;
+            for (size_t index = 0; index < inPhasePath.size(); ++index)
+                inPhase = inPhasePath[index].process (inPhase, inPhaseCoefficients[index]);
+
+            auto quadrature = input;
+            for (size_t index = 0; index < quadraturePath.size(); ++index)
+                quadrature = quadraturePath[index].process (quadrature, quadratureCoefficients[index]);
+
+            // The in-phase path takes one extra sample of delay to line up with the other,
+            // which then leads it by 90 degrees; negating it gives the lagging quadrature
+            // of a true Hilbert transform, so the shifter moves frequencies up.
+            const auto alignedInPhase = delayedInPhase;
+            delayedInPhase = inPhase;
+            return { alignedInPhase, -quadrature };
+        }
+
+    private:
+        // y[n] = a^2 (x[n] + y[n-2]) - x[n-2]
+        struct Section
+        {
+            float x1 = 0.0f, x2 = 0.0f, y1 = 0.0f, y2 = 0.0f;
+
+            float process (float x, float coefficient) noexcept
+            {
+                const auto y = coefficient * (x + y2) - x2;
+                x2 = x1;
+                x1 = x;
+                y2 = y1;
+                y1 = y;
+                return y;
+            }
+        };
+
+        // Section coefficients are the published values squared.
+        static constexpr std::array<float, 4> inPhaseCoefficients {
+            0.6923878f * 0.6923878f,
+            0.9360654322959f * 0.9360654322959f,
+            0.9882295226860f * 0.9882295226860f,
+            0.9987488452737f * 0.9987488452737f
+        };
+        static constexpr std::array<float, 4> quadratureCoefficients {
+            0.4021921162426f * 0.4021921162426f,
+            0.8561710882420f * 0.8561710882420f,
+            0.9722909545651f * 0.9722909545651f,
+            0.9952884791278f * 0.9952884791278f
+        };
+
+        std::array<Section, 4> inPhasePath {};
+        std::array<Section, 4> quadraturePath {};
+        float delayedInPhase = 0.0f;
+    };
+
+    float allpassCoefficient (float frequency) const
+    {
+        const auto tangent = std::tan (juce::MathConstants<float>::pi * frequency
+                                       / static_cast<float> (sampleRate));
+        return (1.0f - tangent) / (1.0f + tangent);
     }
 
     float timeCoefficient (float milliseconds) const
@@ -351,24 +431,24 @@ private:
     }
 
     static constexpr int phaserStageCount = 6;
-    static constexpr int hilbertTapCount = 63;
-    static constexpr int hilbertCentre = hilbertTapCount / 2;
+    static constexpr int coefficientInterval = 8;
 
     double sampleRate = 0.0;
     int channelCount = 0;
     int delayBufferSize = 0;
     int writePosition = 0;
-    int hilbertPosition = 0;
     double phase = 0.0;
     double carrierPhase = 0.0;
     float envelopeValue = 0.0f;
     float activity = 0.0f;
+    int coefficientCountdown = 0;
+    int coefficientEffect = -1;
 
     std::vector<std::vector<float>> delayBuffers;
     std::vector<std::array<float, phaserStageCount>> phaserStates;
     std::vector<float> phaserFeedback;
-    std::vector<std::array<float, hilbertTapCount>> hilbertBuffers;
-    std::array<float, hilbertTapCount> hilbertCoefficients {};
+    std::vector<std::array<float, phaserStageCount>> stageCoefficients;
+    std::vector<HilbertPair> hilbertFilters;
 
     juce::SmoothedValue<float> rate;
     juce::SmoothedValue<float> depth;

@@ -220,6 +220,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout StagMotionBandsAudioProcesso
 
 void StagMotionBandsAudioProcessor::prepareToPlay (double sampleRate, int)
 {
+    preparedSampleRate = sampleRate;
     preparedChannels = juce::jmax (1, getTotalNumOutputChannels());
 
     const juce::dsp::ProcessSpec spec {
@@ -295,10 +296,19 @@ void StagMotionBandsAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
     const auto numChannels = juce::jmin (buffer.getNumChannels(), preparedChannels);
     const auto numSamples = buffer.getNumSamples();
 
-    auto bpm = 120.0;
+    SectionTransport blockTransport;
     if (auto* playHead = getPlayHead())
+    {
         if (const auto position = playHead->getPosition())
-            bpm = position->getBpm().orFallback (120.0);
+        {
+            blockTransport.bpm = position->getBpm().orFallback (120.0);
+            if (position->getIsPlaying())
+                if (const auto ppq = position->getPpqPosition())
+                    blockTransport.ppq = *ppq;
+        }
+    }
+
+    const auto beatsPerSample = blockTransport.bpm / (60.0 * preparedSampleRate);
 
     auto midiEvent = midiMessages.cbegin();
     const auto midiEnd = midiMessages.cend();
@@ -315,12 +325,17 @@ void StagMotionBandsAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
                   || (metadata.numBytes >= 3 && (metadata.data[0] & 0xf0) == 0x90 && metadata.data[2] != 0);
         }
 
+        auto sectionTransport = blockTransport;
+        if (sectionTransport.ppq)
+            *sectionTransport.ppq += beatsPerSample * static_cast<double> (start);
+
         juce::AudioBuffer<float> section (buffer.getArrayOfWritePointers(), numChannels, start, length);
-        processSection (section, noteOn, bpm);
+        processSection (section, noteOn, sectionTransport);
     }
 }
 
-void StagMotionBandsAudioProcessor::processSection (juce::AudioBuffer<float>& section, bool noteOn, double bpm)
+void StagMotionBandsAudioProcessor::processSection (juce::AudioBuffer<float>& section, bool noteOn,
+                                                    const SectionTransport& transport)
 {
     const auto numSamples = section.getNumSamples();
     const auto numChannels = section.getNumChannels();
@@ -359,7 +374,7 @@ void StagMotionBandsAudioProcessor::processSection (juce::AudioBuffer<float>& se
     splitIntoBands (section);
 
     for (int band = 0; band < appliedBandCount; ++band)
-        applyBandEffect (band, numSamples, bpm);
+        applyBandEffect (band, numSamples, transport);
 
     section.clear();
 
@@ -496,7 +511,7 @@ void StagMotionBandsAudioProcessor::splitIntoBands (const juce::AudioBuffer<floa
                      bandBuffers[static_cast<size_t> (band)]);
 }
 
-void StagMotionBandsAudioProcessor::applyBandEffect (int bandIndex, int numSamples, double bpm)
+void StagMotionBandsAudioProcessor::applyBandEffect (int bandIndex, int numSamples, const SectionTransport& transport)
 {
     const auto& pointers = bandParameters[static_cast<size_t> (bandIndex)];
     const auto effectType = appliedEffects[static_cast<size_t> (bandIndex)];
@@ -507,7 +522,7 @@ void StagMotionBandsAudioProcessor::applyBandEffect (int bandIndex, int numSampl
     settings.effectType = effectType;
     settings.waveform = readChoice (pointers.waveform);
     settings.modulationSource = readChoice (pointers.modulationSource);
-    settings.rateHz = tempoSync ? BandModulationEngine::rateForDivision (bpm, division)
+    settings.rateHz = tempoSync ? BandModulationEngine::rateForDivision (transport.bpm, division)
                                 : pointers.rate->load();
     settings.depth = pointers.depth->load();
     settings.feedback = pointers.feedback->load();
@@ -517,10 +532,16 @@ void StagMotionBandsAudioProcessor::applyBandEffect (int bandIndex, int numSampl
     settings.releaseMs = pointers.release->load();
     const auto usesCarrier = effectType == BandModulationEngine::ringMod
                           || effectType == BandModulationEngine::frequencyShifter;
-    settings.carrierHz = tempoSync && usesCarrier ? BandModulationEngine::rateForDivision (bpm, division)
+    settings.carrierHz = tempoSync && usesCarrier ? BandModulationEngine::rateForDivision (transport.bpm, division)
                                                   : pointers.carrierFrequency->load();
 
     auto& engine = modulationEngines[static_cast<size_t> (bandIndex)];
+
+    // Synced LFOs follow the host's bar position while it plays, so they line up with the
+    // music and restart consistently. MIDI retrigger takes priority when it is enabled.
+    if (tempoSync && transport.ppq && pointers.retrigger->load() < 0.5f)
+        engine.setCyclePosition (*transport.ppq / BandModulationEngine::beatsPerCycleForDivision (division));
+
     engine.process (bandBuffers[static_cast<size_t> (bandIndex)], numSamples, settings);
     modulationActivity[static_cast<size_t> (bandIndex)].store (engine.getActivity(), std::memory_order_relaxed);
 }

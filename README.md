@@ -15,7 +15,8 @@ Early JUCE implementation of a multiband modulation plug-in. The current milesto
 - Smoothed modulation parameters to reduce zipper noise during automation
 - DAW-automatable and recallable band, modulation, crossover, Solo, and Mute parameters
 - Stag brand interface shared with Stag Limiter: violet workspace, cream control deck, Inter type and apricot active states
-- Per-band LFO or envelope-follower modulation sources
+- Per-band LFO or envelope-follower modulation sources; the follower works in dB
+  (-48 dBFS to 0 dBFS spans the full modulation range), so quiet bands still move it
 - Adjustable envelope attack and release with a live source activity meter
 - Optional per-band LFO phase retrigger from incoming MIDI note-on messages
 - Streamlined four-band maximum with left/right arrow-key navigation
@@ -29,7 +30,9 @@ Early JUCE implementation of a multiband modulation plug-in. The current milesto
   changes fade through silence
 - Per-band Tremolo with the same LFO, envelope, stereo, and mix architecture
 - Project Sync mode replaces free-rate Hz with musical note divisions
-- Auto Pan, Ring Mod, Phase Warp, and single-sideband Frequency Shifter engines
+- Auto Pan, Ring Mod, Phase Warp, and single-sideband Frequency Shifter engines; the
+  shifter uses an IIR allpass Hilbert pair, so it suppresses the mirror image in low
+  bands too
 
 ## Build
 
@@ -54,12 +57,15 @@ The project intentionally does not copy plug-ins into system folders after build
 
 The processor smoke suite exercises tempo mapping, every effect/waveform combination,
 state restoration, mute behavior, band settings following add/remove, a flat crossover
-sum, host blocks larger than announced, and click-free edits:
+sum, host blocks larger than announced, click-free edits, frequency-shifter image
+rejection, synced LFOs following the host position, and envelope response to quiet bands:
 
 ```sh
 cmake --build build --target StagMotionBandsTests -j 4
 ctest --test-dir build --output-on-failure
 ```
 
-When the plug-in is hosted in a DAW, sync mode follows the host playhead tempo. The
-standalone target uses a 120 BPM fallback because it has no DAW transport.
+When the plug-in is hosted in a DAW, sync mode follows the host playhead tempo, and while
+the transport plays a synced LFO is locked to the host's beat position (unless MIDI
+retrigger is on, which then sets the phase). The standalone target uses a 120 BPM
+fallback because it has no DAW transport.
