@@ -61,7 +61,8 @@ private:
     std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>,
                StagMotionBandsAudioProcessor::maxBands> muteAttachments;
 
-    int draggingSeparator = -1;
+    int draggingSeparator = -1; // sorted position, as drawn
+    int draggingSlot = -1;      // crossover parameter slot being dragged
     int hoveredSeparator = -1;
     int selectedBand = 0;
     float hoveredFrequency = 0.0f;
@@ -162,7 +163,6 @@ public:
 private:
     int deckTop() const;
 
-    StagMotionBandsAudioProcessor& ownerProcessor;
     StagLookAndFeel stagLookAndFeel;
     std::unique_ptr<juce::Drawable> mark;
     SpectrumBandEditor spectrumEditor;

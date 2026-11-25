@@ -384,10 +384,14 @@ void SpectrumBandEditor::mouseDown (const juce::MouseEvent& event)
         return;
 
     draggingSeparator = separatorAtX (event.position.x, 10.0f);
+    draggingSlot = processor.crossoverSlot (draggingSeparator);
+    if (draggingSlot < 0)
+        draggingSeparator = -1;
+
     if (draggingSeparator >= 0)
     {
         if (auto* parameter = processor.getParameters().getParameter (
-                StagMotionBandsAudioProcessor::crossoverParameterId (draggingSeparator)))
+                StagMotionBandsAudioProcessor::crossoverParameterId (draggingSlot)))
             parameter->beginChangeGesture();
 
         setMouseCursor (juce::MouseCursor::LeftRightResizeCursor);
@@ -414,19 +418,20 @@ void SpectrumBandEditor::mouseDrag (const juce::MouseEvent& event)
                            : crossovers[static_cast<size_t> (draggingSeparator + 1)] / 1.08f;
 
     frequency = juce::jlimit (lower, upper, frequency);
-    processor.setCrossover (draggingSeparator, frequency);
+    processor.setCrossover (draggingSlot, frequency);
     updateBandButtons();
     repaint();
 }
 
 void SpectrumBandEditor::mouseUp (const juce::MouseEvent&)
 {
-    if (draggingSeparator >= 0)
+    if (draggingSlot >= 0)
         if (auto* parameter = processor.getParameters().getParameter (
-                StagMotionBandsAudioProcessor::crossoverParameterId (draggingSeparator)))
+                StagMotionBandsAudioProcessor::crossoverParameterId (draggingSlot)))
             parameter->endChangeGesture();
 
     draggingSeparator = -1;
+    draggingSlot = -1;
     setMouseCursor (juce::MouseCursor::CrosshairCursor);
 }
 
@@ -1128,7 +1133,7 @@ void BandControlPanel::resized()
 //==============================================================================
 StagMotionBandsAudioProcessorEditor::StagMotionBandsAudioProcessorEditor (
     StagMotionBandsAudioProcessor& owner)
-    : AudioProcessorEditor (&owner), ownerProcessor (owner), spectrumEditor (owner), effectMenu (owner),
+    : AudioProcessorEditor (&owner), spectrumEditor (owner), effectMenu (owner),
       bandControls (owner, effectMenu)
 {
     setLookAndFeel (&stagLookAndFeel);

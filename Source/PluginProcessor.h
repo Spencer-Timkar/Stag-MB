@@ -25,7 +25,7 @@ public:
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 0.0; }
+    double getTailLengthSeconds() const override;
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -50,8 +50,13 @@ public:
     void removeCrossover (int crossoverIndex);
     void removeBand (int bandIndex);
 
-    // Moves one crossover without a gesture; the caller (a drag) owns the gesture.
-    void setCrossover (int crossoverIndex, float frequencyHz);
+    // Crossover parameters are stored in slots that host automation can leave unsorted;
+    // crossoverSlot maps a sorted position (as drawn) to its parameter slot, or -1.
+    int crossoverSlot (int sortedIndex) const;
+
+    // Moves the crossover in this parameter slot without a gesture; the caller (a drag)
+    // owns the gesture.
+    void setCrossover (int slot, float frequencyHz);
 
     int getAnalyzerSamplesAvailable() const noexcept;
     int popAnalyzerSamples (float* destination, int maxSamples);

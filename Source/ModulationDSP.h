@@ -178,8 +178,8 @@ public:
                 float wet = input;
                 if (settings.effectType == chorus || settings.effectType == flanger)
                 {
-                    const auto baseDelayMs = settings.effectType == chorus ? 8.0f : 2.2f;
-                    const auto excursionMs = settings.effectType == chorus ? 5.5f : 1.9f;
+                    const auto baseDelayMs = settings.effectType == chorus ? chorusBaseDelayMs : flangerBaseDelayMs;
+                    const auto excursionMs = settings.effectType == chorus ? chorusExcursionMs : flangerExcursionMs;
                     const auto delayMs = juce::jmax (
                         0.15f, baseDelayMs + modulation * excursionMs * currentDepth);
                     wet = readDelay (channel, delayMs * static_cast<float> (sampleRate) * 0.001f);
@@ -303,6 +303,16 @@ public:
     {
         const auto beatsPerSecond = static_cast<float> (juce::jlimit (20.0, 400.0, bpm) / 60.0);
         return beatsPerSecond / beatsPerCycleForDivision (divisionIndex);
+    }
+
+    // Seconds for the delay effects' feedback loop to decay by 60 dB at this feedback,
+    // assuming the longest loop (the chorus at full excursion). The phaser's feedback
+    // runs through six first-order allpasses, whose group delay is shorter than that.
+    static double feedbackTailSeconds (float feedback)
+    {
+        const auto magnitude = static_cast<double> (juce::jlimit (0.0f, 0.99f, std::abs (feedback)));
+        const auto passes = magnitude > 0.0 ? std::ceil (std::log (0.001) / std::log (magnitude)) : 1.0;
+        return passes * static_cast<double> (chorusBaseDelayMs + chorusExcursionMs) * 0.001;
     }
 
     // Maps the follower level in dB onto the bipolar modulation range: -48 dBFS and below
@@ -430,6 +440,10 @@ private:
                           channelBuffer[static_cast<size_t> (indexB)]);
     }
 
+    static constexpr float chorusBaseDelayMs = 8.0f;
+    static constexpr float chorusExcursionMs = 5.5f;
+    static constexpr float flangerBaseDelayMs = 2.2f;
+    static constexpr float flangerExcursionMs = 1.9f;
     static constexpr int phaserStageCount = 6;
     static constexpr int coefficientInterval = 8;
 

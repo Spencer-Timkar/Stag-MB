@@ -1,10 +1,13 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+#include <numeric>
+
 namespace
 {
 constexpr float minimumFrequency = 20.0f;
 constexpr float maximumFrequency = 20000.0f;
+constexpr float maximumFeedback = 0.85f;
 
 float clampFrequency (float value)
 {
@@ -123,7 +126,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout StagMotionBandsAudioProcesso
         result.push_back (std::make_unique<juce::AudioParameterFloat> (
             juce::ParameterID { feedbackParameterId (band), 1 },
             "Band " + juce::String (band + 1) + " Feedback",
-            juce::NormalisableRange<float> { -0.85f, 0.85f, 0.001f },
+            juce::NormalisableRange<float> { -maximumFeedback, maximumFeedback, 0.001f },
             0.0f,
             juce::AudioParameterFloatAttributes().withStringFromValueFunction ([] (float value, int) {
                 return juce::String (juce::roundToInt (value * 100.0f)) + "%";
@@ -701,13 +704,34 @@ void StagMotionBandsAudioProcessor::removeBandAndCrossover (int droppedBand, int
     setBandCountWithGesture (oldBandCount - 1);
 }
 
-void StagMotionBandsAudioProcessor::setCrossover (int crossoverIndex, float frequencyHz)
+int StagMotionBandsAudioProcessor::crossoverSlot (int sortedIndex) const
 {
-    if (crossoverIndex < 0 || crossoverIndex >= maxCrossovers)
+    const auto activeCrossovers = getBandCount() - 1;
+    if (sortedIndex < 0 || sortedIndex >= activeCrossovers)
+        return -1;
+
+    std::array<int, maxCrossovers> slots {};
+    std::iota (slots.begin(), slots.end(), 0);
+    std::stable_sort (slots.begin(), slots.begin() + activeCrossovers, [this] (int a, int b) {
+        return clampFrequency (crossoverParameters[static_cast<size_t> (a)]->load())
+             < clampFrequency (crossoverParameters[static_cast<size_t> (b)]->load());
+    });
+
+    return slots[static_cast<size_t> (sortedIndex)];
+}
+
+void StagMotionBandsAudioProcessor::setCrossover (int slot, float frequencyHz)
+{
+    if (slot < 0 || slot >= maxCrossovers)
         return;
 
-    if (auto* parameter = parameters.getParameter (crossoverParameterId (crossoverIndex)))
+    if (auto* parameter = parameters.getParameter (crossoverParameterId (slot)))
         parameter->setValueNotifyingHost (parameter->convertTo0to1 (clampFrequency (frequencyHz)));
+}
+
+double StagMotionBandsAudioProcessor::getTailLengthSeconds() const
+{
+    return BandModulationEngine::feedbackTailSeconds (maximumFeedback);
 }
 
 void StagMotionBandsAudioProcessor::setParameterWithGesture (const juce::String& parameterId, float normalisedValue)

@@ -590,6 +590,83 @@ bool runQuietEnvelopeStillModulatesTest()
 
     return true;
 }
+
+// Hosts keep processing for getTailLengthSeconds() after the input stops; the reported tail
+// must cover the longest feedback ring the parameters allow.
+bool runTailCoversFeedbackRingTest()
+{
+    using Processor = StagMotionBandsAudioProcessor;
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 480;
+
+    for (const auto feedback : { 0.85f, -0.85f })
+    {
+        Processor processor;
+        setParameter (processor, Processor::effectTypeParameterId (0), BandModulationEngine::chorus);
+        setParameter (processor, Processor::feedbackParameterId (0), feedback);
+        setParameter (processor, Processor::depthParameterId (0), 1.0f);
+        setParameter (processor, Processor::mixParameterId (0), 1.0f);
+        setParameter (processor, Processor::rateParameterId (0), 0.3f);
+        processor.prepareToPlay (sampleRate, blockSize);
+
+        juce::AudioBuffer<float> buffer (2, blockSize);
+        juce::MidiBuffer midi;
+        long position = 0;
+        long impulseAt = -1;
+        long lastAudible = -1;
+
+        for (int block = 0; block < 250; ++block)
+        {
+            buffer.clear();
+            if (block == 20)
+            {
+                buffer.setSample (0, 0, 1.0f);
+                buffer.setSample (1, 0, 1.0f);
+                impulseAt = position;
+            }
+
+            processor.processBlock (buffer, midi);
+
+            for (int sample = 0; sample < blockSize; ++sample, ++position)
+                if (impulseAt >= 0 && std::abs (buffer.getSample (0, sample)) > 0.001f)
+                    lastAudible = position;
+        }
+
+        const auto ringSeconds = static_cast<double> (lastAudible - impulseAt) / sampleRate;
+        const auto tailSeconds = processor.getTailLengthSeconds();
+        if (lastAudible < 0 || ringSeconds > tailSeconds)
+        {
+            std::cerr << "  feedback " << feedback << " rings for " << ringSeconds
+                      << " s but the reported tail is " << tailSeconds << " s\n";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// Automation can leave crossover slots unsorted; dragging the separator drawn at a sorted
+// position must move that crossover, not whatever happens to be stored in the same slot.
+bool runCrossoverSlotFollowsSortedOrderTest()
+{
+    using Processor = StagMotionBandsAudioProcessor;
+
+    Processor processor;
+    setParameter (processor, "bandCount", 4.0f);
+    setParameter (processor, Processor::crossoverParameterId (0), 6000.0f);
+    setParameter (processor, Processor::crossoverParameterId (1), 180.0f);
+    setParameter (processor, Processor::crossoverParameterId (2), 1200.0f);
+
+    if (processor.crossoverSlot (0) != 1 || processor.crossoverSlot (1) != 2
+        || processor.crossoverSlot (2) != 0 || processor.crossoverSlot (3) != -1)
+        return false;
+
+    processor.setCrossover (processor.crossoverSlot (0), 250.0f);
+    const auto sorted = processor.getSortedCrossovers();
+    return std::abs (sorted[0] - 250.0f) < 1.0f
+        && std::abs (sorted[1] - 1200.0f) < 1.0f
+        && std::abs (sorted[2] - 6000.0f) < 1.0f;
+}
 }
 
 int main()
@@ -648,6 +725,8 @@ int main()
         { "Frequency shifter rejects the image", runFrequencyShifterRejectsImageTest },
         { "Synced LFO follows the host", runSyncedLfoFollowsHostTest },
         { "Quiet envelope still modulates", runQuietEnvelopeStillModulatesTest },
+        { "Tail covers the feedback ring", runTailCoversFeedbackRingTest },
+        { "Crossover slot follows sorted order", runCrossoverSlotFollowsSortedOrderTest },
     };
 
     for (const auto& [name, test] : regressionTests)

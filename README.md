@@ -58,7 +58,9 @@ The project intentionally does not copy plug-ins into system folders after build
 The processor smoke suite exercises tempo mapping, every effect/waveform combination,
 state restoration, mute behavior, band settings following add/remove, a flat crossover
 sum, host blocks larger than announced, click-free edits, frequency-shifter image
-rejection, synced LFOs following the host position, and envelope response to quiet bands:
+rejection, synced LFOs following the host position, envelope response to quiet bands,
+a tail length that covers the longest feedback ring, and dragging the right crossover
+when automation has left them unsorted:
 
 ```sh
 cmake --build build --target StagMotionBandsTests -j 4
