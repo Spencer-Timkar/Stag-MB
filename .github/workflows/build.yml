@@ -28,10 +28,7 @@ jobs:
             targets: StagMotionBands_VST3 StagMotionBands_AU StagMotionBands_Standalone StagMotionBandsTests
             verify_universal: true
             artifact: StagMotionBands-macOS-universal
-            artifact_path: |
-              build/StagMotionBands_artefacts/Release/AU
-              build/StagMotionBands_artefacts/Release/VST3
-              build/StagMotionBands_artefacts/Release/Standalone
+            artifact_formats: AU VST3 Standalone
           - name: macOS Intel
             os: macos-15-intel
             osx_architectures: ""
@@ -39,7 +36,7 @@ jobs:
             targets: StagMotionBandsTests
             verify_universal: false
             artifact: ""
-            artifact_path: ""
+            artifact_formats: ""
           - name: Windows x64
             os: windows-latest
             osx_architectures: ""
@@ -47,9 +44,7 @@ jobs:
             targets: StagMotionBands_VST3 StagMotionBands_Standalone StagMotionBandsTests
             verify_universal: false
             artifact: StagMotionBands-Windows-x64
-            artifact_path: |
-              build/StagMotionBands_artefacts/Release/VST3
-              build/StagMotionBands_artefacts/Release/Standalone
+            artifact_formats: VST3 Standalone
           - name: Linux x64
             os: ubuntu-24.04
             osx_architectures: ""
@@ -57,9 +52,7 @@ jobs:
             targets: StagMotionBands_VST3 StagMotionBands_Standalone StagMotionBandsTests
             verify_universal: false
             artifact: StagMotionBands-Linux-x64
-            artifact_path: |
-              build/StagMotionBands_artefacts/Release/VST3
-              build/StagMotionBands_artefacts/Release/Standalone
+            artifact_formats: VST3 Standalone
 
     defaults:
       run:
@@ -77,8 +70,8 @@ jobs:
             build-essential pkg-config \
             libasound2-dev libfreetype-dev libfontconfig1-dev \
             libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
-            libxinerama-dev libxrandr-dev libxrender-dev \
-            libgl1-mesa-dev xvfb
+            libxinerama-dev libxrandr-dev libxrender-dev libxi-dev \
+            libgl1-mesa-dev xvfb xauth
 
       - name: Configure
         env:
@@ -179,10 +172,20 @@ jobs:
             done
           fi
 
+      - name: Archive bundles
+        if: matrix.artifact != ''
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          FORMATS: ${{ matrix.artifact_formats }}
+        run: |
+          read -r -a formats <<< "$FORMATS"
+          # Preserve executable bits and symlinks that GitHub's outer ZIP would lose.
+          tar -czf "$ARTIFACT.tar.gz" -C build/StagMotionBands_artefacts/Release "${formats[@]}"
+
       - name: Upload artifact
         if: matrix.artifact != ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact_path }}
+          path: ${{ matrix.artifact }}.tar.gz
           if-no-files-found: error

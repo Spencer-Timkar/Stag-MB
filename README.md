@@ -87,7 +87,7 @@ browser and curl support are disabled):
 ```sh
 sudo apt-get install build-essential pkg-config libasound2-dev libfreetype-dev \
   libfontconfig1-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
-  libxinerama-dev libxrandr-dev libxrender-dev libgl1-mesa-dev
+  libxinerama-dev libxrandr-dev libxrender-dev libxi-dev libgl1-mesa-dev
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --parallel --target StagMotionBands_VST3 StagMotionBands_Standalone
 ```
@@ -99,7 +99,8 @@ push and pull request for macOS universal, macOS Intel (native x86_64 test run),
 x64 and Linux x64 (tests under `xvfb-run`). The macOS job also checks with `lipo` that
 every binary contains both architectures. The plug-ins are uploaded as the workflow
 artifacts `StagMotionBands-macOS-universal`, `StagMotionBands-Windows-x64` and
-`StagMotionBands-Linux-x64`. These builds are unsigned and not notarised, so expect
+`StagMotionBands-Linux-x64`. Extract the `.tar.gz` inside the download to preserve
+executable permissions. These builds are unsigned and not notarised, so expect
 Gatekeeper warnings on macOS (remove the quarantine attribute or allow the plug-in in
 System Settings) and SmartScreen warnings on Windows.
 
