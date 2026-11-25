@@ -3,6 +3,14 @@
 #include <JuceHeader.h>
 #include "ModulationDSP.h"
 
+#if STAG_LICENSING_ENABLED && STAG_PROCESSOR_TESTS
+ #error "Processor test hooks must not be compiled into a licensed plug-in"
+#endif
+
+#if STAG_LICENSING_ENABLED
+ #include "LicenseManager.h"
+#endif
+
 class StagMotionBandsAudioProcessor final : public juce::AudioProcessor
 {
 public:
@@ -12,6 +20,13 @@ public:
 
     StagMotionBandsAudioProcessor();
     ~StagMotionBandsAudioProcessor() override = default;
+
+#if STAG_PROCESSOR_TESTS
+    explicit StagMotionBandsAudioProcessor (const std::atomic<bool>& testLicenseState);
+#endif
+#if STAG_LICENSING_ENABLED
+    LicenseManager& getLicenseManager() noexcept { return licensing.get(); }
+#endif
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
@@ -130,6 +145,10 @@ private:
     };
 
     void processSection (juce::AudioBuffer<float>& section, bool noteOn, const SectionTransport& transport);
+#if STAG_LICENSING_ENABLED || STAG_PROCESSOR_TESTS
+    bool isProcessingLicensed() const noexcept;
+    void processLicenseFade (juce::AudioBuffer<float>& section, bool noteOn, const SectionTransport& transport);
+#endif
     bool targetLayoutDiffers() const noexcept;
     void applyTargetLayout();
     void updateCrossoverTargets();
@@ -159,6 +178,17 @@ private:
     juce::AudioBuffer<float> remainingBuffer;
     int preparedChannels = 0;
     double preparedSampleRate = 44100.0;
+
+#if STAG_LICENSING_ENABLED
+    juce::SharedResourcePointer<LicenseManager> licensing;
+#elif STAG_PROCESSOR_TESTS
+    // The dedicated smoke-test executable can exercise both sides of the gate without file or network I/O.
+    const std::atomic<bool>* testLicenseState = nullptr;
+#endif
+#if STAG_LICENSING_ENABLED || STAG_PROCESSOR_TESTS
+    juce::SmoothedValue<float> licenseWet;
+    juce::AudioBuffer<float> licenseDryBuffer;
+#endif
 
     // Layout = band count and per-band effect type. Changing either fades the output
     // out on the old layout, switches with cleared filter/effect state, then fades in.

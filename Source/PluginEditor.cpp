@@ -7,6 +7,12 @@ namespace
 constexpr float minimumFrequency = 20.0f;
 constexpr float maximumFrequency = 20000.0f;
 constexpr float floorDb = -100.0f;
+constexpr int headerRightMargin = 24;
+constexpr int headerBadgeWidth = 86;
+#if STAG_LICENSING_ENABLED
+constexpr int licenseButtonWidth = 86;
+constexpr int licenseButtonGap = 8;
+#endif
 constexpr std::array<float, 10> frequencyLines {
     20.0f, 50.0f, 100.0f, 200.0f, 500.0f,
     1000.0f, 2000.0f, 5000.0f, 10000.0f, 20000.0f
@@ -1144,6 +1150,139 @@ void BandControlPanel::resized()
     }
 }
 
+#if STAG_LICENSING_ENABLED
+class StagMotionBandsAudioProcessorEditor::LicensePanel final : public juce::Component,
+                                                               private juce::Timer
+{
+public:
+    static constexpr int width = 488;
+    static constexpr int height = 158;
+
+    LicensePanel (StagMotionBandsAudioProcessorEditor& editor, LicenseManager& service)
+        : licensing (service)
+    {
+        setTitle ("Stag Motion Bands License");
+
+        keyEntry.setTitle ("Motion Bands license key");
+        keyEntry.setFont (editor.stagLookAndFeel.regular (14.0f));
+        keyEntry.setPasswordCharacter (0x2022);
+        keyEntry.setTextToShowWhenEmpty ("Paste license key", mutedInk);
+        keyEntry.onTextChange = [this] { updateStatus(); };
+        keyEntry.onReturnKey = [this] { activate(); };
+        keyEntry.onEscapeKey = [&editor] { editor.setLicensePanelOpen (false); };
+
+        activateButton.onClick = [this] { activate(); };
+        deactivateButton.onClick = [this]
+        {
+            licensing.deactivate();
+            updateStatus();
+        };
+        deactivateButton.setTooltip ("Deactivate this computer and free an activation slot.");
+
+        status.setFont (editor.stagLookAndFeel.semibold (14.0f));
+        status.setColour (juce::Label::textColourId, ink);
+        detail.setFont (editor.stagLookAndFeel.regular (13.0f));
+        detail.setColour (juce::Label::textColourId, mutedInk);
+
+        addAndMakeVisible (status);
+        addAndMakeVisible (detail);
+        addAndMakeVisible (keyEntry);
+        addAndMakeVisible (activateButton);
+        addAndMakeVisible (deactivateButton);
+    }
+
+    ~LicensePanel() override { stopTimer(); }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto bounds = getLocalBounds().toFloat().reduced (0.5f);
+        g.setColour (cream);
+        g.fillRoundedRectangle (bounds, 12.0f);
+        g.setColour (deepViolet);
+        g.drawRoundedRectangle (bounds, 12.0f, 1.0f);
+
+        g.setFont (themeOf (*this).semibold (18.0f));
+        g.setColour (violet);
+        g.drawText (getTitle(), getLocalBounds().reduced (16, 10).removeFromTop (26),
+                    juce::Justification::centredLeft, false);
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced (16, 10);
+        area.removeFromTop (29);
+        status.setBounds (area.removeFromTop (20));
+        detail.setBounds (area.removeFromTop (42));
+        area.removeFromTop (5);
+
+        auto row = area.removeFromTop (32);
+        deactivateButton.setBounds (row.removeFromRight (100));
+        row.removeFromRight (8);
+        activateButton.setBounds (row.removeFromRight (88));
+        row.removeFromRight (8);
+        keyEntry.setBounds (row);
+    }
+
+    void visibilityChanged() override
+    {
+        if (isVisible())
+        {
+            updateStatus();
+            startTimerHz (4);
+        }
+        else
+        {
+            stopTimer();
+            keyEntry.clear();
+        }
+    }
+
+    void focusControls()
+    {
+        if (keyEntry.isEnabled())
+            keyEntry.grabKeyboardFocus();
+        else if (deactivateButton.isEnabled())
+            deactivateButton.grabKeyboardFocus();
+    }
+
+private:
+    void timerCallback() override { updateStatus(); }
+
+    void activate()
+    {
+        if (activateButton.isEnabled() && licensing.activate (keyEntry.getText().trim()))
+            keyEntry.clear();
+        updateStatus();
+    }
+
+    void updateStatus()
+    {
+        const auto active = licensing.isActive();
+        const auto busy = licensing.isBusy();
+        keyEntry.setEnabled (! active && ! busy);
+        activateButton.setEnabled (! active && ! busy && keyEntry.getTotalNumChars() != 0);
+        deactivateButton.setEnabled (active && ! busy);
+
+        status.setText (busy ? "Updating license..."
+                             : active ? "Activated on this computer"
+                                      : "Not activated: audio passes through dry.",
+                        juce::dontSendNotification);
+        auto message = licensing.message();
+        if (message.isEmpty())
+            message = active ? "Your activated license works offline."
+                             : "Enter your Motion Bands license key to activate this computer.";
+        detail.setText (message, juce::dontSendNotification);
+    }
+
+    LicenseManager& licensing;
+    juce::TextEditor keyEntry;
+    juce::TextButton activateButton { "Activate" };
+    juce::TextButton deactivateButton { "Deactivate" };
+    juce::Label status;
+    juce::Label detail;
+};
+#endif
+
 //==============================================================================
 StagMotionBandsAudioProcessorEditor::StagMotionBandsAudioProcessorEditor (
     StagMotionBandsAudioProcessor& owner)
@@ -1157,21 +1296,50 @@ StagMotionBandsAudioProcessorEditor::StagMotionBandsAudioProcessorEditor (
     setWantsKeyboardFocus (true);
     setResizable (true, true);
     setResizeLimits (760, 600, 1600, 1050);
-    setSize (1100, 820);
 
     addAndMakeVisible (spectrumEditor);
     addAndMakeVisible (bandControls);
+
+#if STAG_LICENSING_ENABLED
+    licenseButton.getProperties().set (StagProperties::onViolet, true);
+    licenseButton.setColour (juce::TextButton::buttonOnColourId, apricot);
+    licenseButton.setColour (juce::TextButton::textColourOnId, ink);
+    licenseButton.setColour (juce::TextButton::textColourOffId, cream);
+    licenseButton.setTooltip ("Manage the license for Stag Motion Bands.");
+    licenseButton.onClick = [this] { setLicensePanelOpen (! licensePanel->isVisible()); };
+    addAndMakeVisible (licenseButton);
+
+    licensePanel = std::make_unique<LicensePanel> (*this, owner.getLicenseManager());
+    addChildComponent (*licensePanel);
+#endif
 
     spectrumEditor.setBandSelectedCallback ([this] (int band) {
         effectMenu.selectBand (band);
         bandControls.selectBand (band);
     });
+
+    setSize (1100, 820);
 }
 
 StagMotionBandsAudioProcessorEditor::~StagMotionBandsAudioProcessorEditor()
 {
     setLookAndFeel (nullptr);
 }
+
+#if STAG_LICENSING_ENABLED
+void StagMotionBandsAudioProcessorEditor::setLicensePanelOpen (bool open)
+{
+    if (licensePanel->isVisible() == open)
+        return;
+
+    licensePanel->setVisible (open);
+    licenseButton.setToggleState (open, juce::dontSendNotification);
+    if (open)
+        licensePanel->focusControls();
+    else
+        licenseButton.grabKeyboardFocus();
+}
+#endif
 
 int StagMotionBandsAudioProcessorEditor::deckTop() const
 {
@@ -1194,7 +1362,8 @@ void StagMotionBandsAudioProcessorEditor::paint (juce::Graphics& g)
     g.drawText ("Stag Audio  " + juce::String::fromUTF8 ("\xc2\xb7") + "  Multiband modulation",
                 juce::Rectangle<int> (72, 38, 320, 18), juce::Justification::centredLeft, false);
 
-    const auto badge = juce::Rectangle<float> (static_cast<float> (getWidth()) - 24.0f - 86.0f, 21.0f, 86.0f, 26.0f);
+    const auto badge = juce::Rectangle<float> (static_cast<float> (getWidth() - headerRightMargin - headerBadgeWidth),
+                                               21.0f, static_cast<float> (headerBadgeWidth), 26.0f);
     g.setColour (apricot);
     g.fillRoundedRectangle (badge, 13.0f);
     g.setColour (ink);
@@ -1202,14 +1371,20 @@ void StagMotionBandsAudioProcessorEditor::paint (juce::Graphics& g)
     g.drawText ("Alpha " + juce::String (JucePlugin_VersionString).upToLastOccurrenceOf (".", false, false),
                 badge, juce::Justification::centred, false);
 
-    if (getWidth() >= 960)
+    auto helpRight = getWidth() - headerRightMargin - headerBadgeWidth - 20;
+    auto helpMinimumWidth = 960;
+#if STAG_LICENSING_ENABLED
+    helpRight -= licenseButtonWidth + licenseButtonGap;
+    helpMinimumWidth += licenseButtonWidth + licenseButtonGap;
+#endif
+    if (getWidth() >= helpMinimumWidth)
     {
         g.setFont (stagLookAndFeel.regular (13.0f));
         g.setColour (mutedViolet);
         g.drawText ("Double-click to add a band  " + juce::String::fromUTF8 ("\xc2\xb7")
                         + "  Drag dividers  " + juce::String::fromUTF8 ("\xc2\xb7")
                         + "  " + juce::String::fromUTF8 ("\xe2\x86\x90 \xe2\x86\x92") + " switch bands",
-                    juce::Rectangle<int> (400, 21, getWidth() - 400 - 24 - 86 - 20, 26),
+                    juce::Rectangle<int> (400, 21, helpRight - 400, 26),
                     juce::Justification::centredRight, false);
     }
 }
@@ -1219,10 +1394,31 @@ void StagMotionBandsAudioProcessorEditor::resized()
     const auto top = deckTop();
     spectrumEditor.setBounds (16, 68, getWidth() - 32, top - 68 - 14);
     bandControls.setBounds (0, top, getWidth(), getHeight() - top);
+#if STAG_LICENSING_ENABLED
+    const auto right = getWidth() - headerRightMargin;
+    licenseButton.setBounds (right - headerBadgeWidth - licenseButtonGap - licenseButtonWidth,
+                             21, licenseButtonWidth, 26);
+    if (licensePanel != nullptr)
+        licensePanel->setBounds (right - LicensePanel::width, 54, LicensePanel::width, LicensePanel::height);
+#endif
 }
 
 bool StagMotionBandsAudioProcessorEditor::keyPressed (const juce::KeyPress& key)
 {
+#if STAG_LICENSING_ENABLED
+    if (licensePanel->isVisible())
+    {
+        if (key == juce::KeyPress::escapeKey)
+        {
+            setLicensePanelOpen (false);
+            return true;
+        }
+
+        if (licensePanel->hasKeyboardFocus (true))
+            return AudioProcessorEditor::keyPressed (key);
+    }
+#endif
+
     if (key == juce::KeyPress::leftKey)
     {
         spectrumEditor.selectPreviousBand();

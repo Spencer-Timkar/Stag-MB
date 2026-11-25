@@ -39,6 +39,106 @@ double absoluteDifference (const juce::AudioBuffer<float>& a,
     return result;
 }
 
+bool runLicenseGateTest()
+{
+    constexpr int blockLength = 1103; // Larger than both the announced block and the license fade.
+    for (const auto channels : { 1, 2 })
+    {
+        std::atomic<bool> licensed { false };
+        StagMotionBandsAudioProcessor processor (licensed);
+        const auto channelSet = channels == 1 ? juce::AudioChannelSet::mono() : juce::AudioChannelSet::stereo();
+        auto layout = processor.getBusesLayout();
+        layout.inputBuses.set (0, channelSet);
+        layout.outputBuses.set (0, channelSet);
+        if (! processor.setBusesLayout (layout))
+            return false;
+
+        processor.prepareToPlay (44100.0, 17);
+
+        // A DAW can restore a preset while dry. Its mute should only take effect
+        // after activation, when the processor starts from the restored settings.
+        const auto mute = StagMotionBandsAudioProcessor::muteParameterId (0);
+        if (! setParameter (processor, mute, 1.0f))
+            return false;
+        juce::MemoryBlock state;
+        processor.getStateInformation (state);
+        setParameter (processor, mute, 0.0f);
+        processor.setStateInformation (state.getData(), static_cast<int> (state.getSize()));
+
+        juce::AudioBuffer<float> input (channels, blockLength);
+        for (int channel = 0; channel < channels; ++channel)
+            for (int sample = 0; sample < blockLength; ++sample)
+                input.setSample (channel, sample, (channel == 0 ? 0.125f : -0.09375f)
+                                                  * static_cast<float> (1 + sample % 5));
+
+        juce::AudioBuffer<float> output (input);
+        juce::MidiBuffer midi;
+        processor.processBlock (output, midi);
+        if (absoluteDifference (output, input) != 0.0)
+            return false;
+
+        std::array<float, blockLength> analyzer {};
+        if (processor.popAnalyzerSamples (analyzer.data(), blockLength) != blockLength)
+            return false;
+        for (int sample = 0; sample < blockLength; ++sample)
+        {
+            const auto expected = channels == 1 ? input.getSample (0, sample)
+                                                  : (input.getSample (0, sample) + input.getSample (1, sample)) * 0.5f;
+            if (analyzer[static_cast<size_t> (sample)] != expected)
+                return false;
+        }
+
+        const auto fadeIsSmooth = [&] (bool wet)
+        {
+            for (int channel = 0; channel < channels; ++channel)
+            {
+                auto previousGain = wet ? 1.0f : 0.0f;
+                for (int sample = 0; sample < blockLength; ++sample)
+                {
+                    const auto dry = input.getSample (channel, sample);
+                    const auto value = output.getSample (channel, sample);
+                    const auto gain = value / dry; // The fully wet output is muted.
+                    if (! std::isfinite (gain) || std::abs (gain - previousGain) > 0.003f)
+                        return false;
+                    if (sample >= 1000 && value != (wet ? 0.0f : dry))
+                        return false;
+                    previousGain = gain;
+                }
+            }
+            return true;
+        };
+
+        const auto renderTransition = [&]
+        {
+            int offset = 0;
+            for (const auto requested : { 17, 31, 511, blockLength })
+            {
+                const auto length = juce::jmin (requested, blockLength - offset);
+                juce::AudioBuffer<float> block (output.getArrayOfWritePointers(), channels, offset, length);
+                processor.processBlock (block, midi);
+                offset += length;
+            }
+        };
+
+        licensed.store (true);
+        renderTransition();
+        if (! fadeIsSmooth (true))
+            return false;
+
+        output.makeCopyOf (input, true);
+        licensed.store (false);
+        renderTransition();
+        if (! fadeIsSmooth (false))
+            return false;
+
+        output.makeCopyOf (input, true);
+        processor.processBlock (output, midi);
+        if (absoluteDifference (output, input) != 0.0)
+            return false;
+    }
+    return true;
+}
+
 bool runEffectSmoke (int effectType, int waveform,
                      int modulationSource = BandModulationEngine::lfo)
 {
@@ -861,6 +961,7 @@ int main()
     }
 
     const std::pair<const char*, bool (*)()> regressionTests[] {
+        { "License gate preserves dry audio and fades in both directions", runLicenseGateTest },
         { "Band settings follow their bands", runBandSettingsFollowBandsTest },
         { "Crossover sum is flat", runCrossoverSumIsFlatTest },
         { "Oversized block is processed", runOversizedBlockIsProcessedTest },

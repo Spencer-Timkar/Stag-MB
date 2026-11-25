@@ -164,11 +164,20 @@ public:
 private:
     int deckTop() const;
 
+#if STAG_LICENSING_ENABLED
+    class LicensePanel;
+    void setLicensePanelOpen (bool open);
+#endif
+
     StagLookAndFeel stagLookAndFeel;
     std::unique_ptr<juce::Drawable> mark;
     SpectrumBandEditor spectrumEditor;
     EffectMenuPanel effectMenu;
     BandControlPanel bandControls;
+#if STAG_LICENSING_ENABLED
+    juce::TextButton licenseButton { "License" };
+    std::unique_ptr<LicensePanel> licensePanel;
+#endif
     juce::TooltipWindow tooltipWindow { this, 700 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StagMotionBandsAudioProcessorEditor)

@@ -1,6 +1,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+#include <cmath>
 #include <numeric>
 
 namespace
@@ -59,6 +60,14 @@ StagMotionBandsAudioProcessor::StagMotionBandsAudioProcessor()
         pointers.range = parameters.getRawParameterValue (rangeParameterId (band));
     }
 }
+
+#if STAG_PROCESSOR_TESTS
+StagMotionBandsAudioProcessor::StagMotionBandsAudioProcessor (const std::atomic<bool>& state)
+    : StagMotionBandsAudioProcessor()
+{
+    testLicenseState = &state;
+}
+#endif
 
 juce::AudioProcessorValueTreeState::ParameterLayout StagMotionBandsAudioProcessor::createParameterLayout()
 {
@@ -281,6 +290,12 @@ void StagMotionBandsAudioProcessor::prepareToPlay (double sampleRate, int)
     for (auto& bandBuffer : bandBuffers)
         bandBuffer.setSize (preparedChannels, sectionSize);
 
+#if STAG_LICENSING_ENABLED || STAG_PROCESSOR_TESTS
+    licenseDryBuffer.setSize (preparedChannels, sectionSize);
+    licenseWet.reset (sampleRate, 0.02);
+    licenseWet.setCurrentAndTargetValue (isProcessingLicensed() ? 1.0f : 0.0f);
+#endif
+
     applyTargetLayout();
     layoutFade = LayoutFade::none;
     layoutGain = 1.0f;
@@ -318,6 +333,23 @@ void StagMotionBandsAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
 
     if (preparedChannels == 0)
         return;
+
+#if STAG_LICENSING_ENABLED || STAG_PROCESSOR_TESTS
+    const auto licensed = isProcessingLicensed();
+    const auto fullyDry = ! licenseWet.isSmoothing() && licenseWet.getCurrentValue() == 0.0f;
+    if (fullyDry)
+    {
+        if (! licensed)
+            return;
+
+        // Automation still updates the parameters while dry. Start from the current
+        // layout with cleared filters/effects instead of crossfading back to stale state.
+        applyTargetLayout();
+        layoutFade = LayoutFade::none;
+        layoutGain = 1.0f;
+    }
+    licenseWet.setTargetValue (licensed ? 1.0f : 0.0f);
+#endif
 
     jassert (buffer.getNumChannels() <= preparedChannels);
     const auto numChannels = juce::jmin (buffer.getNumChannels(), preparedChannels);
@@ -357,9 +389,66 @@ void StagMotionBandsAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
             *sectionTransport.ppq += beatsPerSample * static_cast<double> (start);
 
         juce::AudioBuffer<float> section (buffer.getArrayOfWritePointers(), numChannels, start, length);
+#if STAG_LICENSING_ENABLED || STAG_PROCESSOR_TESTS
+        if (licenseWet.isSmoothing())
+        {
+            processLicenseFade (section, noteOn, sectionTransport);
+            if (licenseWet.getCurrentValue() == 0.0f)
+            {
+                for (auto& activity : modulationActivity)
+                    activity.store (0.0f, std::memory_order_relaxed);
+                break; // The rest of this block already contains untouched dry audio.
+            }
+            continue;
+        }
+#endif
         processSection (section, noteOn, sectionTransport);
     }
 }
+
+#if STAG_LICENSING_ENABLED || STAG_PROCESSOR_TESTS
+bool StagMotionBandsAudioProcessor::isProcessingLicensed() const noexcept
+{
+   #if STAG_LICENSING_ENABLED
+    return licensing->isActive();
+   #else
+    return testLicenseState == nullptr || testLicenseState->load (std::memory_order_relaxed);
+   #endif
+}
+
+void StagMotionBandsAudioProcessor::processLicenseFade (juce::AudioBuffer<float>& section, bool noteOn,
+                                                       const SectionTransport& transport)
+{
+    const auto length = section.getNumSamples();
+    const auto channels = section.getNumChannels();
+    for (int channel = 0; channel < channels; ++channel)
+        licenseDryBuffer.copyFrom (channel, 0, section, channel, 0, length);
+
+    processSection (section, noteOn, transport);
+
+    std::array<float, sectionSize> wetAmounts;
+    int blendSamples = 0;
+    while (blendSamples < length && licenseWet.isSmoothing())
+    {
+        const auto wet = licenseWet.getNextValue();
+        if (wet == 0.0f)
+            break; // Leave the endpoint and all subsequent samples exactly dry.
+        wetAmounts[static_cast<size_t> (blendSamples++)] = wet;
+    }
+
+    const auto remainingDry = licenseWet.getCurrentValue() == 0.0f ? length - blendSamples : 0;
+    for (int channel = 0; channel < channels; ++channel)
+    {
+        const auto* dry = licenseDryBuffer.getReadPointer (channel);
+        auto* output = section.getWritePointer (channel);
+        for (int sample = 0; sample < blendSamples; ++sample)
+            output[sample] = std::lerp (dry[sample], output[sample], wetAmounts[static_cast<size_t> (sample)]);
+
+        if (remainingDry != 0)
+            section.copyFrom (channel, blendSamples, dry + blendSamples, remainingDry);
+    }
+}
+#endif
 
 void StagMotionBandsAudioProcessor::processSection (juce::AudioBuffer<float>& section, bool noteOn,
                                                     const SectionTransport& transport)

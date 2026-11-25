@@ -25,7 +25,7 @@ jobs:
             os: macos-15
             osx_architectures: "arm64;x86_64"
             cmake_platform: ""
-            targets: StagMotionBands_VST3 StagMotionBands_AU StagMotionBands_Standalone StagMotionBandsTests
+            targets: StagMotionBands_VST3 StagMotionBands_AU StagMotionBands_Standalone StagMotionBandsTests StagMotionBandsLicenseTests
             verify_universal: true
             artifact: StagMotionBands-macOS-universal
             artifact_formats: AU VST3 Standalone
@@ -33,7 +33,7 @@ jobs:
             os: macos-15-intel
             osx_architectures: ""
             cmake_platform: ""
-            targets: StagMotionBandsTests
+            targets: StagMotionBandsTests StagMotionBandsLicenseTests
             verify_universal: false
             artifact: ""
             artifact_formats: ""
@@ -41,7 +41,7 @@ jobs:
             os: windows-latest
             osx_architectures: ""
             cmake_platform: x64
-            targets: StagMotionBands_VST3 StagMotionBands_Standalone StagMotionBandsTests
+            targets: StagMotionBands_VST3 StagMotionBands_Standalone StagMotionBandsTests StagMotionBandsLicenseTests
             verify_universal: false
             artifact: StagMotionBands-Windows-x64
             artifact_formats: VST3 Standalone
@@ -49,7 +49,7 @@ jobs:
             os: ubuntu-24.04
             osx_architectures: ""
             cmake_platform: ""
-            targets: StagMotionBands_VST3 StagMotionBands_Standalone StagMotionBandsTests
+            targets: StagMotionBands_VST3 StagMotionBands_Standalone StagMotionBandsTests StagMotionBandsLicenseTests
             verify_universal: false
             artifact: StagMotionBands-Linux-x64
             artifact_formats: VST3 Standalone
@@ -71,12 +71,15 @@ jobs:
             libasound2-dev libfreetype-dev libfontconfig1-dev \
             libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
             libxinerama-dev libxrandr-dev libxrender-dev libxi-dev \
-            libgl1-mesa-dev xvfb xauth
+            libgl1-mesa-dev libcurl4-openssl-dev xvfb xauth
 
       - name: Configure
         env:
           OSX_ARCHITECTURES: ${{ matrix.osx_architectures }}
           CMAKE_PLATFORM: ${{ matrix.cmake_platform }}
+          LICENSE_STORE_ID: ${{ vars.STAG_LICENSE_STORE_ID }}
+          LICENSE_PRODUCT_ID: ${{ vars.STAG_LICENSE_PRODUCT_ID }}
+          LICENSE_VARIANT_ID: ${{ vars.STAG_LICENSE_VARIANT_ID }}
         run: |
           args=(-S . -B build -DCMAKE_BUILD_TYPE=Release)
           if [ -n "$OSX_ARCHITECTURES" ]; then
@@ -85,6 +88,12 @@ jobs:
           if [ -n "$CMAKE_PLATFORM" ]; then
             # Visual Studio generator (CMake's default on Windows) for x64.
             args+=(-A "$CMAKE_PLATFORM")
+          fi
+          if [[ -n "${LICENSE_STORE_ID}${LICENSE_PRODUCT_ID}${LICENSE_VARIANT_ID}" ]]; then
+            args+=(-DSTAG_LICENSING_ENABLED=ON -DSTAG_LICENSE_ENVIRONMENT=test
+              "-DSTAG_LICENSE_STORE_ID=$LICENSE_STORE_ID"
+              "-DSTAG_LICENSE_PRODUCT_ID=$LICENSE_PRODUCT_ID"
+              "-DSTAG_LICENSE_VARIANT_ID=$LICENSE_VARIANT_ID")
           fi
           cmake "${args[@]}"
 

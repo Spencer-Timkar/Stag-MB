@@ -81,13 +81,12 @@ cmake -S . -B build -A x64
 cmake --build build --config Release --parallel --target StagMotionBands_VST3 StagMotionBands_Standalone
 ```
 
-Linux x64 (Debian/Ubuntu packages; curl, WebKit and GTK are not needed because the web
-browser and curl support are disabled):
+Linux x64 (Debian/Ubuntu packages; WebKit and GTK are not needed):
 
 ```sh
 sudo apt-get install build-essential pkg-config libasound2-dev libfreetype-dev \
   libfontconfig1-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
-  libxinerama-dev libxrandr-dev libxrender-dev libxi-dev libgl1-mesa-dev
+  libxinerama-dev libxrandr-dev libxrender-dev libxi-dev libgl1-mesa-dev libcurl4-openssl-dev
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --parallel --target StagMotionBands_VST3 StagMotionBands_Standalone
 ```
@@ -104,6 +103,34 @@ executable permissions. These builds are unsigned and not notarised, so expect
 Gatekeeper warnings on macOS (remove the quarantine attribute or allow the plug-in in
 System Settings) and SmartScreen warnings on Windows.
 
+## Test licensing
+
+Default builds and public CI artifacts without a configured catalog are developer
+builds, not licensed customer downloads. To build an activation-enabled test
+plug-in, use the Motion Bands **test** catalog IDs (not Limiter's):
+
+```sh
+cmake -S . -B cmake-build-licensed -DCMAKE_BUILD_TYPE=Release \
+  -DSTAG_LICENSING_ENABLED=ON -DSTAG_LICENSE_ENVIRONMENT=test \
+  -DSTAG_LICENSE_STORE_ID="$STORE_ID" -DSTAG_LICENSE_PRODUCT_ID="$PRODUCT_ID" \
+  -DSTAG_LICENSE_VARIANT_ID="$VARIANT_ID"
+cmake --build cmake-build-licensed --config Release --parallel
+```
+
+Use the architecture or generator options above for the target platform. Setting
+the three `STAG_LICENSE_*_ID` GitHub repository variables opts the workflow into
+licensed test artifacts. These IDs are public metadata, not credentials.
+
+Copy the test key from **My tools**, open **License…**, and activate online once.
+The same OS user shares one slot across plug-in formats; a key has three slots
+total across operating systems. Activated builds reopen offline. Deactivate
+online to reclaim a slot. Already activated offline installations cannot see a
+refund or a remote reset.
+
+[Lemon Squeezy is winding down](https://www.lemonsqueezy.com/blog/saying-goodbye-to-lemon-squeezy).
+Do not launch live sales with this test integration. Choose and verify a replacement
+activation path before shipping a commercial build.
+
 ## Test
 
 The processor smoke suite exercises tempo mapping, every effect/waveform combination,
@@ -115,8 +142,8 @@ a tail length that covers the longest feedback ring, and dragging the right cros
 when automation has left them unsorted:
 
 ```sh
-cmake --build build --target StagMotionBandsTests -j 4
-ctest --test-dir build --output-on-failure
+cmake --build build --config Release --target StagMotionBandsTests StagMotionBandsLicenseTests -j 4
+ctest --test-dir build -C Release --output-on-failure
 ```
 
 When the plug-in is hosted in a DAW, sync mode follows the host playhead tempo, and while
