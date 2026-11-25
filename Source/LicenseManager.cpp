@@ -15,23 +15,23 @@
 
 namespace {
 constexpr std::string_view environment = STAG_LICENSE_ENVIRONMENT;
+constexpr std::string_view activationUrl = STAG_ACTIVATION_URL;
 constexpr auto productSlug = "motion-bands";
+constexpr int recordSchema = 2;
+constexpr int activationLimit = 3;
 constexpr int recordLimit = 16 * 1024;
 constexpr int responseLimit = 32 * 1024;
 
-constexpr bool catalogId(std::string_view id)
-{
-    if (id.empty() || id.front() == '0')
-        return false;
-    for (auto digit : id)
-        if (digit < '0' || digit > '9')
-            return false;
-    return true;
-}
+#if JUCE_MAC
+constexpr auto platformName = "macOS";
+#elif JUCE_WINDOWS
+constexpr auto platformName = "Windows";
+#else
+constexpr auto platformName = "Linux";
+#endif
 
-static_assert(environment == "test" || environment == "live");
-static_assert(catalogId(STAG_LICENSE_STORE_ID) && catalogId(STAG_LICENSE_PRODUCT_ID)
-              && catalogId(STAG_LICENSE_VARIANT_ID));
+static_assert(environment == "sandbox" || environment == "production");
+static_assert(activationUrl.starts_with("https://") && activationUrl.size() > 8 && !activationUrl.ends_with('/'));
 
 // A file lock coordinates separately loaded plug-in binaries in the same host
 // as well as other host processes. It is scoped to this user's activation file.
@@ -93,18 +93,6 @@ juce::var readJson(juce::InputStream& stream, int limit)
     return juce::JSON::parse(juce::String::fromUTF8(data, length));
 }
 
-bool matchesId(const juce::var& value, const char* expected)
-{
-    return (value.isString() || value.isInt() || value.isInt64()) && value.toString() == expected;
-}
-
-bool matchesCatalog(const juce::var& object)
-{
-    return matchesId(object["store_id"], STAG_LICENSE_STORE_ID)
-        && matchesId(object["product_id"], STAG_LICENSE_PRODUCT_ID)
-        && matchesId(object["variant_id"], STAG_LICENSE_VARIANT_ID);
-}
-
 bool isTrue(const juce::var& value)
 {
     return value.isBool() && static_cast<bool>(value);
@@ -116,12 +104,12 @@ juce::String stringField(const juce::var& object, const char* name)
     return value.isString() ? value.toString() : juce::String{};
 }
 
-bool recordMatchesBuild(const juce::var& record)
+bool isUuid(const juce::String& text)
 {
-    return record["schema"].isInt() && static_cast<int>(record["schema"]) == 1
-        && stringField(record, "product") == productSlug
-        && stringField(record, "environment") == STAG_LICENSE_ENVIRONMENT
-        && matchesCatalog(record);
+    if (text.length() != 36)
+        return false;
+    const juce::Uuid parsed(text);
+    return !parsed.isNull() && parsed.toDashedString() == text;
 }
 
 bool validKeyLength(const juce::String& key)
@@ -130,62 +118,98 @@ bool validKeyLength(const juce::String& key)
     return length >= 16 && length <= 128;
 }
 
+bool validActivationId(const juce::String& id)
+{
+    return id.isNotEmpty() && id.length() <= 128;
+}
+
+bool recordMatchesBuild(const juce::var& record)
+{
+    return record["schema"].isInt() && static_cast<int>(record["schema"]) == recordSchema
+        && stringField(record, "product") == productSlug
+        && stringField(record, "environment") == STAG_LICENSE_ENVIRONMENT;
+}
+
 bool isActiveRecord(const juce::var& record)
 {
     return recordMatchesBuild(record) && isTrue(record["active"])
         && validKeyLength(stringField(record, "key"))
-        && stringField(record, "instance_id").isNotEmpty()
-        && stringField(record, "installation_id").isNotEmpty();
+        && validActivationId(stringField(record, "activation_id"))
+        && isUuid(stringField(record, "installation_id"));
 }
 
-bool isPerpetualThreeSlotKey(const juce::var& response)
-{
-    const auto& license = response["license_key"];
-    const auto& limit = license["activation_limit"];
-    return limit.isInt() && static_cast<int>(limit) == 3
-        && license.hasProperty("expires_at") && license["expires_at"].isVoid();
-}
-
+// An inactive schema-2 record. Key, activation and pending attempt start empty.
 juce::var inactiveRecord(const juce::String& installation)
 {
     auto* object = new juce::DynamicObject();
     juce::var record(object);
-    object->setProperty("schema", 1);
-    object->setProperty("active", false);
+    object->setProperty("schema", recordSchema);
     object->setProperty("product", productSlug);
     object->setProperty("environment", STAG_LICENSE_ENVIRONMENT);
-    object->setProperty("store_id", STAG_LICENSE_STORE_ID);
-    object->setProperty("product_id", STAG_LICENSE_PRODUCT_ID);
-    object->setProperty("variant_id", STAG_LICENSE_VARIANT_ID);
     object->setProperty("installation_id", installation);
+    object->setProperty("active", false);
+    object->setProperty("key", juce::var());
+    object->setProperty("activation_id", juce::var());
+    object->setProperty("pending_attempt_id", juce::var());
     return record;
 }
 
-LicenseManager::Reply request(const juce::String& action, const juce::StringPairArray& fields)
+bool isActivation(const juce::var& response)
 {
-    // The key and instance are form fields, never URL query parameters or logs.
-    auto url = juce::URL("https://api.lemonsqueezy.com/v1/licenses/" + action);
-    for (int i = 0; i < fields.size(); ++i)
-        url = url.withParameter(fields.getAllKeys()[i], fields.getAllValues()[i]);
-
-    int status = 0;
-    auto stream = url.createInputStream(juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inPostData)
-                                            .withHttpRequestCmd("POST")
-                                            .withExtraHeaders("Accept: application/json\r\n")
-                                            .withConnectionTimeoutMs(15000)
-                                            .withNumRedirectsToFollow(0)
-                                            .withStatusCode(&status));
-    return {status, stream != nullptr && status == 200 ? readJson(*stream, responseLimit) : juce::var{}};
+    const auto& limit = response["activation_limit"];
+    return stringField(response, "status") == "activated"
+        && validActivationId(stringField(response, "activation_id"))
+        && stringField(response, "product") == productSlug
+        && stringField(response, "environment") == STAG_LICENSE_ENVIRONMENT
+        && limit.isInt() && static_cast<int>(limit) == activationLimit;
 }
 
-bool releaseSlot(const LicenseManager::Transport& transport, const juce::String& key,
-                 const juce::String& instance)
+// Answers that settle an attempt; anything else may have allocated a slot, so
+// the attempt id is kept for the next try.
+bool isDefinitiveDenial(int status)
 {
-    juce::StringPairArray fields;
-    fields.set("license_key", key);
-    fields.set("instance_id", instance);
-    const auto reply = transport("deactivate", fields);
-    return reply.status == 200 && isTrue(reply.json["deactivated"]) && matchesCatalog(reply.json["meta"]);
+    return status == 400 || status == 403 || status == 404 || status == 409 || status == 410;
+}
+
+juce::String activationOutcome(int status)
+{
+    switch (status)
+    {
+        case 202: return "Activation is still being confirmed. Try again in a moment; it won't use another computer slot.";
+        case 400: return "Activation request was rejected. Update Stag Motion Bands and try again.";
+        case 403: return "This key doesn't match this build. Download Stag Motion Bands from My tools.";
+        case 404: return "This key can't activate Stag Motion Bands. Copy the Motion Bands key from My tools.";
+        case 409: return "This key is already active on three computers. Deactivate one of them, then try again.";
+        case 410: return "This license has been revoked. Contact Stag Audio support.";
+        case 429: return "Too many activation attempts. Wait a minute and try again.";
+        default:  return "Couldn't reach activation. Check your connection and try again.";
+    }
+}
+
+juce::var requestBody(const juce::String& key, const juce::String& installation)
+{
+    auto* object = new juce::DynamicObject();
+    juce::var body(object);
+    object->setProperty("product", productSlug);
+    object->setProperty("environment", STAG_LICENSE_ENVIRONMENT);
+    object->setProperty("key", key);
+    object->setProperty("installation_id", installation);
+    return body;
+}
+
+LicenseManager::Reply request(const juce::String& action, const juce::var& body)
+{
+    // The key travels only in the JSON body, never in the URL or logs.
+    int status = 0;
+    auto stream = juce::URL(juce::String(STAG_ACTIVATION_URL) + "/" + action)
+                      .withPOSTData(juce::JSON::toString(body, true))
+                      .createInputStream(juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inPostData)
+                                             .withHttpRequestCmd("POST")
+                                             .withExtraHeaders("Content-Type: application/json\r\nAccept: application/json\r\n")
+                                             .withConnectionTimeoutMs(15000)
+                                             .withNumRedirectsToFollow(0)
+                                             .withStatusCode(&status));
+    return {status, stream != nullptr && status == 200 ? readJson(*stream, responseLimit) : juce::var{}};
 }
 } // namespace
 
@@ -201,7 +225,7 @@ juce::File LicenseManager::defaultFile()
 #else
     const auto root = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory);
 #endif
-    return root.getChildFile("Stag Audio/Motion Bands/activation-" STAG_LICENSE_ENVIRONMENT ".json");
+    return root.getChildFile("Stag Audio/Motion Bands/activation-v2-" STAG_LICENSE_ENVIRONMENT ".json");
 }
 
 LicenseManager::LicenseManager(juce::File cache, Transport sender)
@@ -360,48 +384,38 @@ void LicenseManager::updateActivation(bool activation, const juce::String& key)
 
 void LicenseManager::activateOnline(const juce::String& key, const juce::var& previous)
 {
-    juce::StringPairArray fields;
-    fields.set("license_key", key);
-    const auto validation = transport("validate", fields);
-    if (validation.status != 200 || !isTrue(validation.json["valid"])
-        || !matchesCatalog(validation.json["meta"]) || !isPerpetualThreeSlotKey(validation.json))
-    {
-        setMessage(validation.status == 0 || validation.status >= 500
-                       ? "Couldn't reach activation. Check your connection and try again."
-                       : "This key can't activate Stag Motion Bands. Check the key and your three-computer allowance.");
-        return;
-    }
+    const auto ours = recordMatchesBuild(previous);
+    auto installation = ours ? stringField(previous, "installation_id") : juce::String{};
+    if (!isUuid(installation))
+        installation = juce::Uuid().toDashedString();
 
-    auto installation = recordMatchesBuild(previous) ? stringField(previous, "installation_id") : juce::String{};
-    if (installation.isEmpty())
-        installation = juce::Uuid().toString();
+    // An unresolved attempt for the same key is retried under the same id, so a
+    // timeout or 202 followed by a retry can never allocate a second slot.
+    auto attempt = ours && stringField(previous, "key") == key ? stringField(previous, "pending_attempt_id")
+                                                                : juce::String{};
+    if (!isUuid(attempt))
+        attempt = juce::Uuid().toDashedString();
+
     auto record = inactiveRecord(installation);
+    auto* object = record.getDynamicObject();
+    object->setProperty("key", key);
+    object->setProperty("pending_attempt_id", attempt);
     if (!save(record))
     {
         setMessage("Couldn't save activation here. Check your user-folder permissions.");
         return;
     }
 
-    fields.set("instance_name", "Motion Bands " + installation.substring(0, 8));
-    const auto reply = transport("activate", fields);
-    const auto instance = stringField(reply.json["instance"], "id");
-    const auto& activated = reply.json["activated"];
-    const auto allocated = reply.status == 200 && isTrue(activated);
-    if (!allocated || instance.isEmpty())
-    {
-        const auto explicitlyDenied = (reply.status >= 400 && reply.status < 500)
-            || (reply.status == 200 && activated.isBool() && !allocated);
-        setMessage(explicitlyDenied
-                       ? "Couldn't activate this key. It may have reached its three-computer limit."
-                       : "Activation didn't finish. If a slot was used, contact support before retrying.");
-        return;
-    }
+    auto body = requestBody(key, installation);
+    body.getDynamicObject()->setProperty("attempt_id", attempt);
+    body.getDynamicObject()->setProperty("label", juce::String("Motion Bands ") + platformName + " "
+                                                      + installation.substring(0, 8));
+    const auto reply = transport("activate", body);
 
-    if (matchesCatalog(reply.json["meta"]) && isPerpetualThreeSlotKey(reply.json))
+    if (reply.status == 200 && isActivation(reply.json))
     {
-        auto* object = record.getDynamicObject();
-        object->setProperty("key", key);
-        object->setProperty("instance_id", instance);
+        object->setProperty("activation_id", stringField(reply.json, "activation_id"));
+        object->setProperty("pending_attempt_id", juce::var());
         object->setProperty("active", true);
         if (save(record))
         {
@@ -409,25 +423,40 @@ void LicenseManager::activateOnline(const juce::String& key, const juce::var& pr
             setMessage("Activated. Ready for offline use.");
             return;
         }
+        setMessage("Activated online but couldn't save it here. Check your user-folder permissions and activate "
+                   "again; it won't use another computer slot.");
+        return;
     }
 
-    setMessage(releaseSlot(transport, key, instance)
-                   ? "Couldn't keep this activation. The slot was released; check the key and user-folder permissions."
-                   : "Couldn't keep this activation or confirm its release. Contact support before retrying.");
+    if (isDefinitiveDenial(reply.status))
+    {
+        // Nothing was allocated: forget the key and the settled attempt.
+        save(inactiveRecord(installation));
+        setMessage(activationOutcome(reply.status));
+        return;
+    }
+
+    setMessage(reply.status == 200
+                   ? "Activation returned an unexpected answer. Try again; it won't use another computer slot."
+                   : activationOutcome(reply.status));
 }
 
 void LicenseManager::deactivateOnline(const juce::var& record)
 {
     // Stage an inactive record with no key before releasing the slot. Once the
-    // provider confirms release, no second disk write is needed to stay inactive.
-    if (!save(inactiveRecord(stringField(record, "installation_id"))))
+    // server confirms release, no second disk write is needed to stay inactive.
+    const auto installation = stringField(record, "installation_id");
+    if (!save(inactiveRecord(installation)))
     {
         setMessage("Couldn't update local activation. Check your user-folder permissions before releasing this installation.");
         return;
     }
     active.store(false);
 
-    if (releaseSlot(transport, stringField(record, "key"), stringField(record, "instance_id")))
+    auto body = requestBody(stringField(record, "key"), installation);
+    body.getDynamicObject()->setProperty("activation_id", stringField(record, "activation_id"));
+    const auto reply = transport("deactivate", body);
+    if (reply.status == 200 && stringField(reply.json, "status") == "deactivated")
     {
         setMessage("Installation released. You can activate another computer.");
         return;

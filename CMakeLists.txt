@@ -25,19 +25,16 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(JUCE)
 
 option(STAG_LICENSING_ENABLED "Require a Stag Motion Bands license (off for developer builds)" OFF)
-set(STAG_LICENSE_ENVIRONMENT "test" CACHE STRING "Licensing environment: test or live")
-foreach(id STORE PRODUCT VARIANT)
-    set(STAG_LICENSE_${id}_ID "" CACHE STRING "Motion Bands Lemon Squeezy ${id} ID")
-endforeach()
+set(STAG_LICENSE_ENVIRONMENT "" CACHE STRING "Licensing environment: sandbox or production")
+set(STAG_ACTIVATION_URL "" CACHE STRING "Stag activation API base URL (https, no trailing slash)")
 if(STAG_LICENSING_ENABLED)
-    if(NOT STAG_LICENSE_ENVIRONMENT MATCHES "^(test|live)$")
-        message(FATAL_ERROR "STAG_LICENSE_ENVIRONMENT must be test or live")
+    # Licensed builds fail closed: both values must be set explicitly.
+    if(NOT STAG_LICENSE_ENVIRONMENT MATCHES "^(sandbox|production)$")
+        message(FATAL_ERROR "Set STAG_LICENSE_ENVIRONMENT to sandbox or production")
     endif()
-    foreach(id STORE PRODUCT VARIANT)
-        if(NOT STAG_LICENSE_${id}_ID MATCHES "^[1-9][0-9]*$")
-            message(FATAL_ERROR "Set STAG_LICENSE_${id}_ID to the Motion Bands catalog ID")
-        endif()
-    endforeach()
+    if(NOT STAG_ACTIVATION_URL MATCHES "^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*[A-Za-z0-9._~-])?$")
+        message(FATAL_ERROR "Set STAG_ACTIVATION_URL to the https Stag activation API base, without a trailing slash")
+    endif()
 endif()
 
 if(APPLE)
@@ -105,10 +102,8 @@ if(STAG_LICENSING_ENABLED)
     target_sources(StagMotionBands PRIVATE Source/LicenseManager.cpp Source/LicenseManager.h)
     target_compile_definitions(StagMotionBands PUBLIC STAG_LICENSING_ENABLED=1)
     target_compile_definitions(StagMotionBands PRIVATE
-        STAG_LICENSE_STORE_ID="${STAG_LICENSE_STORE_ID}"
-        STAG_LICENSE_PRODUCT_ID="${STAG_LICENSE_PRODUCT_ID}"
-        STAG_LICENSE_VARIANT_ID="${STAG_LICENSE_VARIANT_ID}"
         STAG_LICENSE_ENVIRONMENT="${STAG_LICENSE_ENVIRONMENT}"
+        STAG_ACTIVATION_URL="${STAG_ACTIVATION_URL}"
     )
 endif()
 
@@ -155,12 +150,10 @@ juce_add_console_app(StagMotionBandsLicenseTests NEEDS_CURL TRUE)
 juce_generate_juce_header(StagMotionBandsLicenseTests)
 target_sources(StagMotionBandsLicenseTests PRIVATE Source/LicenseManager.cpp Tests/LicenseTests.cpp)
 target_include_directories(StagMotionBandsLicenseTests PRIVATE Source)
-# Explicit non-catalog IDs for the injected-transport test executable only.
+# Sandbox build with an unreachable placeholder endpoint; the tests inject the transport.
 target_compile_definitions(StagMotionBandsLicenseTests PRIVATE
-    STAG_LICENSE_STORE_ID="1"
-    STAG_LICENSE_PRODUCT_ID="2"
-    STAG_LICENSE_VARIANT_ID="3"
-    STAG_LICENSE_ENVIRONMENT="test"
+    STAG_LICENSE_ENVIRONMENT="sandbox"
+    STAG_ACTIVATION_URL="https://activation.invalid/api/v1/activation"
 )
 target_link_libraries(StagMotionBandsLicenseTests PRIVATE
     juce::juce_core

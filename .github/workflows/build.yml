@@ -77,9 +77,8 @@ jobs:
         env:
           OSX_ARCHITECTURES: ${{ matrix.osx_architectures }}
           CMAKE_PLATFORM: ${{ matrix.cmake_platform }}
-          LICENSE_STORE_ID: ${{ vars.STAG_LICENSE_STORE_ID }}
-          LICENSE_PRODUCT_ID: ${{ vars.STAG_LICENSE_PRODUCT_ID }}
-          LICENSE_VARIANT_ID: ${{ vars.STAG_LICENSE_VARIANT_ID }}
+          ACTIVATION_URL: ${{ vars.STAG_ACTIVATION_URL }}
+          LICENSE_ENVIRONMENT: ${{ vars.STAG_LICENSE_ENVIRONMENT }}
         run: |
           args=(-S . -B build -DCMAKE_BUILD_TYPE=Release)
           if [ -n "$OSX_ARCHITECTURES" ]; then
@@ -89,11 +88,15 @@ jobs:
             # Visual Studio generator (CMake's default on Windows) for x64.
             args+=(-A "$CMAKE_PLATFORM")
           fi
-          if [[ -n "${LICENSE_STORE_ID}${LICENSE_PRODUCT_ID}${LICENSE_VARIANT_ID}" ]]; then
-            args+=(-DSTAG_LICENSING_ENABLED=ON -DSTAG_LICENSE_ENVIRONMENT=test
-              "-DSTAG_LICENSE_STORE_ID=$LICENSE_STORE_ID"
-              "-DSTAG_LICENSE_PRODUCT_ID=$LICENSE_PRODUCT_ID"
-              "-DSTAG_LICENSE_VARIANT_ID=$LICENSE_VARIANT_ID")
+          if [ -n "$ACTIVATION_URL" ]; then
+            # Opt-in licensed artifacts (sandbox unless overridden); CMake fails
+            # closed on an invalid activation URL or environment.
+            args+=(-DSTAG_LICENSING_ENABLED=ON
+              "-DSTAG_LICENSE_ENVIRONMENT=${LICENSE_ENVIRONMENT:-sandbox}"
+              "-DSTAG_ACTIVATION_URL=$ACTIVATION_URL")
+          elif [ -n "$LICENSE_ENVIRONMENT" ]; then
+            echo "::error::STAG_LICENSE_ENVIRONMENT is set without STAG_ACTIVATION_URL"
+            exit 1
           fi
           cmake "${args[@]}"
 

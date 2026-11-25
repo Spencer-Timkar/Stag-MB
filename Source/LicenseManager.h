@@ -4,13 +4,15 @@
 #include <atomic>
 #include <functional>
 
-// The shared local activation is an offline cache, not DRM. No seller
-// credentials or activation data belong in the plug-in's host state.
+// The shared local activation is an offline cache, not DRM. The plug-in only
+// talks to the Stag activation API; seller credentials never ship in it and
+// activation data never goes into the host state.
 class LicenseManager : private juce::Thread
 {
 public:
     struct Reply { int status = 0; juce::var json; };
-    using Transport = std::function<Reply(const juce::String&, const juce::StringPairArray&)>;
+    // Sends one JSON POST to the Stag activation API ("activate" or "deactivate").
+    using Transport = std::function<Reply(const juce::String& action, const juce::var& body)>;
 
     static juce::File defaultFile();
     explicit LicenseManager(juce::File = defaultFile(), Transport = {});

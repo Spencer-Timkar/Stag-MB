@@ -103,33 +103,40 @@ executable permissions. These builds are unsigned and not notarised, so expect
 Gatekeeper warnings on macOS (remove the quarantine attribute or allow the plug-in in
 System Settings) and SmartScreen warnings on Windows.
 
-## Test licensing
+## Licensing
 
-Default builds and public CI artifacts without a configured catalog are developer
-builds, not licensed customer downloads. To build an activation-enabled test
-plug-in, use the Motion Bands **test** catalog IDs (not Limiter's):
+Default builds and public CI artifacts without a configured activation endpoint are
+developer builds with no license gate, not customer downloads. Licensed builds sell
+through Polar: the website issues a perpetual Motion Bands license key (separate from
+Limiter's), and the plug-in talks only to the Stag activation API, never to Polar
+directly. No provider credentials or catalog IDs are compiled into the plug-in.
+
+Configure a licensed build with the environment (`sandbox` or `production`) and the
+HTTPS base of the matching Stag activation API (no trailing slash). Configuration
+fails if either is missing or invalid:
 
 ```sh
 cmake -S . -B cmake-build-licensed -DCMAKE_BUILD_TYPE=Release \
-  -DSTAG_LICENSING_ENABLED=ON -DSTAG_LICENSE_ENVIRONMENT=test \
-  -DSTAG_LICENSE_STORE_ID="$STORE_ID" -DSTAG_LICENSE_PRODUCT_ID="$PRODUCT_ID" \
-  -DSTAG_LICENSE_VARIANT_ID="$VARIANT_ID"
+  -DSTAG_LICENSING_ENABLED=ON -DSTAG_LICENSE_ENVIRONMENT=sandbox \
+  -DSTAG_ACTIVATION_URL=https://stag-audio-website-preview.vercel.app/api/v1/activation
 cmake --build cmake-build-licensed --config Release --parallel
 ```
 
-Use the architecture or generator options above for the target platform. Setting
-the three `STAG_LICENSE_*_ID` GitHub repository variables opts the workflow into
-licensed test artifacts. These IDs are public metadata, not credentials.
+Use the architecture or generator options above for the target platform. Setting the
+`STAG_ACTIVATION_URL` GitHub repository variable opts the workflow into licensed
+artifacts, built for `sandbox` unless the optional `STAG_LICENSE_ENVIRONMENT` variable
+says otherwise. Both are public configuration, not credentials. Use separately
+configured, gated release builds for production customer downloads.
 
-Copy the test key from **My tools**, open **License…**, and activate online once.
-The same OS user shares one slot across plug-in formats; a key has three slots
-total across operating systems. Activated builds reopen offline. Deactivate
-online to reclaim a slot. Already activated offline installations cannot see a
-refund or a remote reset.
-
-[Lemon Squeezy is winding down](https://www.lemonsqueezy.com/blog/saying-goodbye-to-lemon-squeezy).
-Do not launch live sales with this test integration. Choose and verify a replacement
-activation path before shipping a commercial build.
+Copy the key from **My tools**, open **License…**, and activate online once. The
+plug-in posts to `<STAG_ACTIVATION_URL>/activate` and stores the result in
+`Stag Audio/Motion Bands/activation-v2-<environment>.json` under Application Support
+(macOS), AppData (Windows) or `$XDG_DATA_HOME` / `~/.local/share` (Linux). The same OS
+user shares one slot across AU, VST3 and Standalone; a key has three slots total across
+operating systems. Activated builds reopen offline indefinitely. If an activation
+times out or is still pending, retrying reuses the same attempt and never takes a second
+slot. Deactivate online to reclaim a slot. Already activated offline installations
+cannot see a refund or a remote reset.
 
 ## Test
 
